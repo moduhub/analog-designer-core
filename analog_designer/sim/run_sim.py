@@ -46,6 +46,7 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 
 from analog_designer.core import workspace
 from analog_designer.results import fom
@@ -343,16 +344,13 @@ def managed_container():
     _cap_ngspice_threads()'s own docstring for why OMP_NUM_THREADS=1 above
     turned out not to be sufficient on its own."""
     image = workspace.container_image()
-    result = subprocess.run(
-        [
-            "docker", "run", "-d", "--rm",
-            "-e", "OMP_NUM_THREADS=1",
-            "-v", f"{workspace.PROJECT_ROOT}:{workspace.container_project_root()}",
-            "-w", workspace.container_project_root(),
-            image, "sleep", "infinity",
-        ],
-        capture_output=True, text=True,
-    )
+    docker_args = [
+        "docker", "run", "-d", "--rm",
+        "-e", "OMP_NUM_THREADS=1",
+        "-v", f"{workspace.PROJECT_ROOT}:{workspace.container_project_root()}",
+    ]
+    docker_args += ["-w", workspace.container_project_root(), image, "sleep", "infinity"]
+    result = subprocess.run(docker_args, capture_output=True, text=True)
     if result.returncode != 0:
         sys.exit(f"could not start a container from image {image!r}:\n{result.stderr}")
     container_id = result.stdout.strip()
@@ -648,7 +646,9 @@ def resolve_sub_block_params(config, sub_blocks, params):
             sub_params = _variation_params(chosen)
         else:
             sub_params = {n: pdef["default"] for n, pdef in sub_block_cfg["parameters"].items()}
-        resolved_by_instance[instance] = resolve_derived_params(sub_block_cfg, sub_params)
+        resolved_by_instance[instance] = resolve_generator_params(
+            sub_block_cfg, resolve_derived_params(sub_block_cfg, sub_params)
+        )
     return resolved_by_instance
 
 
@@ -773,6 +773,7 @@ def resolve_materialization_params(block_cfg, params, sch_dir=None):
     schematic, instead of racing every other concurrently-running
     hierarchical variation on the shared path."""
     resolved = resolve_derived_params(block_cfg, params)
+    resolved = resolve_generator_params(block_cfg, resolved)
     sub_blocks = block_cfg.get("sub_blocks")
     if sub_blocks:
         sub_block_resolved = materialize_sub_blocks(workspace.CONFIG, sub_blocks, params, sch_dir=sch_dir)
@@ -789,7 +790,7 @@ def resolve_materialization_params(block_cfg, params, sch_dir=None):
 def calculated_param_descriptions(topology_cfg):
     """{name: description} for every derived_parameters name a topology
     declares (width_groups' members, import_params, import_metrics,
-    formulas) -- independent of whether resolve_display_params() can
+    formulas, generator) -- independent of whether resolve_display_params() can
     actually compute a value for each one right now. Used by the GUI to
     know which parameter rows to mark as "calculated" (equation icon) and
     what to show for them even when it couldn't resolve a value this time
@@ -816,6 +817,8 @@ def calculated_param_descriptions(topology_cfg):
         descriptions[name] = entry.get("description") or f"{entry['from']}.{entry['test']}.{entry['metric']}"
     for name, entry in derived_cfg.get("formulas", {}).items():
         descriptions[name] = entry.get("description") or entry.get("expr", "")
+    for name, entry in derived_cfg.get("generator", {}).items():
+        descriptions[name] = entry.get("description", "")
     return descriptions
 
 
@@ -840,6 +843,7 @@ def resolve_display_params(topology_cfg, params):
     resolved = dict(params)
     try:
         resolved = resolve_derived_params(topology_cfg, params)
+        resolved = resolve_generator_params(topology_cfg, resolved)
     except (StaleParameterSchema, KeyError, ValueError, TypeError):
         return resolved
 
@@ -1009,7 +1013,29 @@ def compute_definition_hash(block_cfg, test_cfg):
     parts = [json.dumps(test_cfg, sort_keys=True)]
     topology_sch = workspace.PROJECT_ROOT / "sch" / block_cfg["schematic"]
     parts.append(topology_sch.read_text(encoding="utf-8"))
-    parts.append((workspace.PROJECT_ROOT / test_cfg["testbench"]).read_text(encoding="utf-8"))
+    if "generator" in block_cfg:
+        # A "generator"-backed topology's own electrical values come from
+        # resolve_generator_params()/openems_generator_runner.py, not from
+        # the schematic template's own literal text (which just has
+        # 'l'/'rs'/... placeholder tokens) -- so a real code change to the
+        # generator SHOULD invalidate cached results the same way a
+        # topology .sch edit already does for every other topology, hashed
+        # here IN ADDITION TO the schematic template above (both matter
+        # now that "schematic" is a real static template again, not a
+        # per-variation generated output). "generator" is a project-repo-
+        # relative file path (same convention as "testbench"/"parser"),
+        # not an importable dotted module -- it's project-specific code
+        # that lives in the open project's own repo, not in this shared
+        # tool.
+        try:
+            gen_path = workspace.PROJECT_ROOT / block_cfg["generator"]
+            parts.append(gen_path.read_text(encoding="utf-8"))
+        except Exception:
+            # best-effort: don't let a resolution hiccup here crash the
+            # whole freshness check for every test in the block.
+            parts.append(block_cfg["generator"])
+    if "testbench" in test_cfg:
+        parts.append((workspace.PROJECT_ROOT / test_cfg["testbench"]).read_text(encoding="utf-8"))
     parser_path = workspace.PROJECT_ROOT / test_cfg["parser"]
     parts.append(parser_path.read_text(encoding="utf-8"))
     common_path = parser_path.parent / "_common.py"
@@ -1397,6 +1423,60 @@ def load_parser(relpath):
     return module
 
 
+def _load_generator_module(block_cfg):
+    """Dynamically loads a "generator"-backed topology's own project-repo-
+    relative Python module (block_cfg["generator"]) by file path -- same
+    pattern as load_parser() above. This is project-specific code living
+    in the open project's own repo, not an importable package of this
+    tool."""
+    gen_path = workspace.PROJECT_ROOT / block_cfg["generator"]
+    spec = importlib.util.spec_from_file_location(gen_path.stem, gen_path)
+    generator = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(generator)
+    return generator
+
+
+def resolve_generator_params(block_cfg, params):
+    """params (already expanded by resolve_derived_params()) expanded with
+    a "generator"-backed topology's own derived ELECTRICAL parameters --
+    dynamically loads block_cfg["generator"] and calls its own
+    geometry_from_params() + load_stack() + fit_electrical_params(...,
+    em_result=None) -- the fast, no-FDTD, placeholder-quality path (real
+    Cox from geometry+stack, generic placeholder for the rest -- see that
+    module's own fit_electrical_params() docstring). A no-op for every
+    topology without a "generator" key, exactly like resolve_formulas()/
+    resolve_derived_params() are no-ops when a topology declares no
+    width_groups/formulas.
+
+    This is what lets a "generator"-backed topology's own schematic go
+    back to being a normal STATIC template (e.g. inductor_spiral.sch, with
+    'l'/'rs'/'cox'/... substitute_params() tokens) like every other
+    topology -- no more bespoke per-variation .sch-writing function; the
+    existing substitute_params()/check_unresolved() pipeline does the rest
+    uniformly.
+
+    NEVER runs the real (hours-long) FDTD characterization -- that only
+    happens inside the container via openems_generator_runner.py, invoked
+    from run_one_openems(). Called from resolve_materialization_params()/
+    resolve_sub_block_params()/resolve_display_params(), all of which must
+    stay fast and synchronous.
+
+    Fixed at corner "tt": materialization/display shows ONE set of derived
+    values shared by every corner/temperature condition a later test might
+    sweep (same as every other topology's static .sch), so there's no
+    single "right" per-condition corner to pick here -- "tt" matches this
+    topology's own single-condition test default in config.json."""
+    if "generator" not in block_cfg:
+        return dict(params)
+    generator = _load_generator_module(block_cfg)
+    geometry = generator.geometry_from_params(params)
+    stack = generator.load_stack("tt")
+    fitted = generator.fit_electrical_params(geometry, stack, em_result=None)
+    resolved = dict(params)
+    resolved.update({name: format_spice_value(value, "") for name, value in fitted.items()})
+    return resolved
+
+
 MOS_CORNER_SECTION = {
     "tt": "mos_tt", "ss": "mos_ss", "ff": "mos_ff",
     # Local (intra-die) device mismatch and global (inter-die) process
@@ -1632,7 +1712,7 @@ def _soa_diagnostics_from_raw(netlist_path, raw_path):
 
 def run_one_ngspice(container, test_name, tb_source, conditions, tb_params_base,
                      run_dir, container_run_dir, container_rcfile, ctx,
-                     sim_timeout=290, n_threads=1):
+                     block_cfg=None, block=None, topology=None, sim_timeout=290, n_threads=1):
     run_dir.mkdir(parents=True, exist_ok=True)
     # `set num_threads=<n_threads>` here is what actually governs this run's
     # thread count (see THREAD_POLICY/run_test()): read AFTER the
@@ -1726,15 +1806,16 @@ def run_one_ngspice(container, test_name, tb_source, conditions, tb_params_base,
 
 def run_one_netlist(container, test_name, tb_source, conditions, tb_params_base,
                      run_dir, container_run_dir, container_rcfile, ctx,
-                     sim_timeout=290, n_threads=1):
+                     block_cfg=None, block=None, topology=None, sim_timeout=290, n_threads=1):
     """Static counterpart to run_one_ngspice: netlists the testbench through
     xschem exactly the same way, but never invokes ngspice -- for tests
     whose parser reads geometry/structure straight out of the expanded
     .spice text (area estimation, e.g.) instead of simulation output.
-    sim_timeout/n_threads are accepted only to keep SIMULATOR_RUNNERS'
-    entries call-compatible; unused here since nothing simulates (see
-    THREAD_POLICY's own "netlist" entry, minimum=preferred=0). ctx IS
-    used, for _netlist()'s own mos_corner_section lookup."""
+    sim_timeout/n_threads/block_cfg/block/topology are accepted only to
+    keep SIMULATOR_RUNNERS' entries call-compatible; unused here since
+    nothing simulates (see THREAD_POLICY's own "netlist" entry,
+    minimum=preferred=0). ctx IS used, for _netlist()'s own
+    mos_corner_section lookup."""
     netlist_result = _netlist(container, test_name, tb_source, conditions, tb_params_base,
                                run_dir, container_run_dir, container_rcfile, ctx)
     if isinstance(netlist_result, dict):
@@ -1763,7 +1844,7 @@ def xyce_plugin_so(pdk_name):
 
 def run_one_xyce(container, test_name, tb_source, conditions, tb_params_base,
                   run_dir, container_run_dir, container_rcfile, ctx,
-                  sim_timeout=290, n_threads=1):
+                  block_cfg=None, block=None, topology=None, sim_timeout=290, n_threads=1):
     run_dir.mkdir(parents=True, exist_ok=True)
     # No .spiceinit equivalent for Xyce -- plugins load via -plugin on the
     # command line below, not a container-cwd init file ngspice relies on.
@@ -1862,7 +1943,200 @@ def _strip_xyce_print_header(data_file):
     data_file.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
 
 
-SIMULATOR_RUNNERS = {"ngspice": run_one_ngspice, "netlist": run_one_netlist, "xyce": run_one_xyce}
+_OPENEMS_F_MAX_HZ = 20e9
+_OPENEMS_N_FREQ = 201
+
+
+def _openems_placeholder_cache_doc(generator, geometry, corner="tt", n_freq=_OPENEMS_N_FREQ, f_max_hz=_OPENEMS_F_MAX_HZ):
+    """Fabricates a cache_doc in the exact shape run_one_openems() writes
+    for a real run (freqs_hz/re/im/q/srf_ghz/peak_q/peak_q_freq_ghz) --
+    used only under ANALOG_DESIGNER_OPENEMS_PLACEHOLDER, see
+    run_one_openems()'s own docstring. Derives Y11(f) from the SAME simple
+    series-RL model fit_electrical_params() itself assumes at low frequency
+    (Y11 = 1/(Rs + jwL)), using its own placeholder-path l/rs -- so this
+    curve is smoothly inductive (monotonically rising Q, no SRF within the
+    swept range, same as a real un-fitted low-loss inductor's own low-
+    frequency behavior would look before self-resonance), plausible enough
+    to exercise plots/parsers without ever being mistaken for FDTD-accurate
+    data (peak_q's own value alone -- a bare series-RL model's Q keeps
+    rising forever, never actually peaking -- is a tell an FDTD run's own
+    result never has).
+
+    `generator` is the already-loaded module (see run_one_openems -- the
+    caller loads it once and passes it in here, rather than this helper
+    re-resolving block_cfg["generator"] itself)."""
+    import math
+
+    stack = generator.load_stack(corner)
+    fitted = generator.fit_electrical_params(geometry, stack, em_result=None)
+    rs_total = 2 * fitted["rs"]
+    l_total = 2 * fitted["l"]
+
+    freqs = [1e6 + i * (f_max_hz - 1e6) / (n_freq - 1) for i in range(n_freq)]
+    re, im, q = [], [], []
+    for f in freqs:
+        w = 2 * math.pi * f
+        denom = complex(rs_total, w * l_total)
+        y11 = 1.0 / denom
+        re.append(y11.real)
+        im.append(y11.imag)
+        q.append(-y11.imag / y11.real)
+
+    return {
+        "geometry": geometry,
+        "freqs_hz": freqs, "re": re, "im": im, "q": q,
+        "srf_ghz": None, "peak_q": q[-1], "peak_q_freq_ghz": freqs[-1] / 1e9,
+    }
+
+
+def run_one_openems(container, test_name, tb_source, conditions, tb_params_base,
+                     run_dir, container_run_dir, container_rcfile, ctx,
+                     block_cfg=None, block=None, topology=None, sim_timeout=36000, n_threads=1):
+    """Runner for "generator"-backed topologies (e.g. inductor.spiral) --
+    there is no xschem/.sch testbench at all (`tb_source` is unused; this
+    test's config.json entry has no "testbench" key), the openEMS FDTD run
+    itself IS the measurement. Self-contained caching keyed by a hash of the
+    resolved geometry params (`tb_params_base`, the same resolved-parameter
+    dict every other runner already receives): a FDTD run costs hours, so a
+    second variation with identical geometry must not re-run it.
+
+    The generator script itself is project-specific GF180MCU code, so it
+    lives in the OPEN PROJECT's own repo (block_cfg["generator"], a
+    project-repo-relative file path -- same convention as "parser"/
+    "testbench") rather than in this shared tool. `block_cfg` is threaded
+    in from run_variation() via run_test() specifically so this generic
+    path resolution works for ANY generator-backed block/topology, not
+    just this one -- `block`/`topology` are threaded the same way, purely
+    to keep the on-disk cache directory generic too
+    (sim/_generator_cache/<block>/<topology>/) instead of a hardcoded
+    "inductor"/"spiral_openems" pair.
+
+    The actual FDTD run happens inside the container via a GENERIC script
+    this tool owns, openems_generator_runner.py -- copied into run_dir
+    (already mounted in-container at container_run_dir, so no extra bind-
+    mount/PYTHONPATH is needed, unlike an earlier version that hardcoded a
+    dotted `analog_designer_pro.modeling.*` module path -- see
+    managed_container() git history if that's ever relevant again) and
+    invoked there by container-relative file path. That script dynamically
+    loads the SAME project generator module and does the actual
+    `FDTD.Run()`/`CalcPort()`/Y11-Q-SRF extraction (openEMS-specific, not
+    PDK-specific, so it doesn't belong in the project's own generator.py
+    at all) before calling the generator's own fit_electrical_params()
+    with the real result.
+
+    ANALOG_DESIGNER_OPENEMS_PLACEHOLDER=1 (env var, checked below): skips
+    the real (hours-long) FDTD run entirely (no docker_exec at all) and
+    writes a placeholder Y11(f) sweep instead (see
+    _openems_placeholder_cache_doc()) -- for exercising this runner/the
+    parser/the GUI's plots end to end without paying for openEMS.
+    Deliberately an env var, not a config.json or GUI toggle: opt-in per
+    shell session, impossible to leave silently enabled inside a project's
+    own checked-in config where it could taint a real characterization run
+    without anyone noticing."""
+    run_dir.mkdir(parents=True, exist_ok=True)
+    generator = _load_generator_module(block_cfg)
+    geometry = generator.geometry_from_params(tb_params_base)
+
+    cache_key = hashlib.sha1(json.dumps(geometry, sort_keys=True).encode()).hexdigest()[:16]
+    cache_dir = workspace.PROJECT_ROOT / "sim" / "_generator_cache" / block / topology
+    cache_file = cache_dir / f"{cache_key}.json"
+    cache_field_png = cache_dir / f"{cache_key}__field.png"
+    data_file = run_dir / f"{test_name}_0.json"
+    # tb_yparam_spiral.py's extract() derives this same "__field.png"
+    # sibling name from data_path itself -- keep the two conventions in
+    # sync if either ever changes.
+    data_field_png = run_dir / f"{test_name}_0__field.png"
+
+    if cache_file.exists():
+        data_file.write_text(cache_file.read_text(encoding="utf-8"), encoding="utf-8")
+        if cache_field_png.exists():
+            data_field_png.write_bytes(cache_field_png.read_bytes())
+        return {"status": "success", "data_file": data_file, "diagnostics": []}
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    if os.environ.get("ANALOG_DESIGNER_OPENEMS_PLACEHOLDER"):
+        # No real FDTD run happens in placeholder mode, so there's no
+        # field dump to render either -- tb_yparam_spiral.py's
+        # _save_field_plot() falls back to its own "not available"
+        # placeholder text when data_field_png doesn't exist, same as it
+        # already does before any run has ever happened at all.
+        cache_doc = _openems_placeholder_cache_doc(generator, geometry)
+        cache_text = json.dumps(cache_doc)
+        cache_file.write_text(cache_text, encoding="utf-8")
+        data_file.write_text(cache_text, encoding="utf-8")
+        return {"status": "success", "data_file": data_file, "diagnostics": []}
+
+    runner_src = Path(__file__).with_name("openems_generator_runner.py")
+    (run_dir / "openems_generator_runner.py").write_bytes(runner_src.read_bytes())
+    container_runner_py = f"{container_run_dir}/openems_generator_runner.py"
+    container_generator_py = f"{workspace.container_project_root()}/{block_cfg['generator']}"
+    container_geometry_json = f"{container_run_dir}/geometry.json"
+    container_params_json = f"{container_run_dir}/fitted.params.json"
+    container_cache_json = f"{container_run_dir}/result.json"
+    container_field_png = f"{container_run_dir}/field.png"
+    (run_dir / "geometry.json").write_text(json.dumps(geometry), encoding="utf-8")
+
+    # Redirected straight to a file INSIDE container_run_dir (already
+    # bind-mounted at run_dir on the host) instead of letting docker_exec()
+    # capture it -- docker_exec()'s own subprocess.run(capture_output=True)
+    # only hands stdout/stderr back once the ENTIRE command exits, so for
+    # every OTHER simulator (seconds-scale runs) that's invisible, but for
+    # a multi-hour FDTD run it meant openems_run.log plain didn't exist on
+    # disk at all until the run was already over -- exactly what someone
+    # tailing it mid-run (the same "periodic energy checks" practice this
+    # project's own standalone diagnostic scripts already established) was
+    # missing. `stdbuf -oL -eL` forces line-buffered output even though
+    # stdout/stderr are no longer a TTY once redirected to a file, so each
+    # openEMS "[@ ...] Timestep: ... Energy: ...dB" line lands on disk as
+    # it's printed, not batched behind libc's own full-buffering default
+    # for non-TTY output.
+    container_log = f"{container_run_dir}/openems_run.log"
+    sim_cmd = (
+        f'mkdir -p "{container_run_dir}" && '
+        f'export OMP_NUM_THREADS={n_threads} && '
+        f'stdbuf -oL -eL timeout {sim_timeout} python3 "{container_runner_py}" '
+        f'--generator "{container_generator_py}" --geometry-json "{container_geometry_json}" '
+        f'--corner tt --f-max {_OPENEMS_F_MAX_HZ} '
+        f'--out "{container_params_json}" --cache-out "{container_cache_json}" '
+        f'--field-png "{container_field_png}" '
+        f'> "{container_log}" 2>&1'
+    )
+    sim_result = docker_exec(container, sim_cmd, timeout=sim_timeout + 30)
+    log_path = run_dir / "openems_run.log"
+    if log_path.exists():
+        log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    else:
+        # Only happens if the command never reached the redirected part at
+        # all (e.g. `mkdir -p` itself failed) -- fall back to whatever
+        # bash's own stdout/stderr captured, and make sure a log file
+        # exists either way so callers never have to special-case this.
+        log_text = sim_result.stdout + "\n" + sim_result.stderr
+        log_path.write_text(log_text, encoding="utf-8")
+
+    out_json = run_dir / "result.json"
+    if sim_result.returncode != 0 or not out_json.exists():
+        return {
+            "status": "error", "openems_exit_code": sim_result.returncode,
+            "error": log_text[-2000:], "diagnostics": [],
+        }
+    cache_file.write_text(out_json.read_text(encoding="utf-8"), encoding="utf-8")
+    data_file.write_text(out_json.read_text(encoding="utf-8"), encoding="utf-8")
+    # The field PNG is genuinely optional (render_field_dump() is
+    # best-effort inside openems_generator_runner.py -- see its own
+    # comment on why a dump/render failure must never take the real Y11
+    # result down with it), so its absence here is expected, not an error.
+    out_field_png = run_dir / "field.png"
+    if out_field_png.exists():
+        cache_field_png.write_bytes(out_field_png.read_bytes())
+        data_field_png.write_bytes(out_field_png.read_bytes())
+    return {"status": "success", "data_file": data_file, "diagnostics": []}
+
+
+SIMULATOR_RUNNERS = {
+    "ngspice": run_one_ngspice, "netlist": run_one_netlist, "xyce": run_one_xyce,
+    "openems": run_one_openems,
+}
 
 # How many CPU cores each simulator's OWN invocation should ask
 # workspace.core_pool() for (see CpuBudget.reserve()): "minimum" is the
@@ -1872,22 +2146,22 @@ SIMULATOR_RUNNERS = {"ngspice": run_one_ngspice, "netlist": run_one_netlist, "xy
 # reserve()'s own adaptive-grant docstring). ngspice/Xyce condition runs
 # are cheap and want to fan out as widely as possible, so both are 1;
 # "netlist" never simulates at all (see run_one_netlist), so it doesn't
-# need to wait on the budget for anything. A future openEMS entry (not
-# wired into SIMULATOR_RUNNERS yet -- see spiral_inductor_openems.py's own
-# module docstring) would want the opposite shape: a small "minimum" (it
-# still has to run even when busy) but a large "preferred", e.g.
-# `max(1, workspace.core_pool().total() - 2)`, since a single FDTD run
-# benefits from nearly the whole machine when nothing else is competing
-# for it.
+# need to wait on the budget for anything. "openems" wants the opposite
+# shape: a small "minimum" (it still has to run even when busy) but a
+# large "preferred", `max(1, workspace.core_pool().total() - 2)`, since a
+# single FDTD run benefits from nearly the whole machine when nothing else
+# is competing for it.
 THREAD_POLICY = {
     "ngspice": {"minimum": 1, "preferred": 1},
     "xyce": {"minimum": 1, "preferred": 1},
     "netlist": {"minimum": 0, "preferred": 0},
+    "openems": {"minimum": 1, "preferred": max(1, workspace.core_pool().total() - 2)},
 }
 
 
 def run_test(container, variation, test_name, test_cfg, defaults, ctx,
-             sim_dir, container_sim_dir, container_rcfile):
+             sim_dir, container_sim_dir, container_rcfile, block_params=None,
+             block_cfg=None, block=None, topology=None):
     simulator = test_cfg.get("simulator", "ngspice")
     runner = SIMULATOR_RUNNERS.get(simulator)
     if runner is None:
@@ -1917,6 +2191,15 @@ def run_test(container, variation, test_name, test_cfg, defaults, ctx,
     # this must track the test's own declared simulator, not always ngspice's.
     tb_params_base["models_dir"] = ctx.xyce_models_dir if simulator == "xyce" else ctx.models_dir
     tb_params_base["stdcell_dir"] = ctx.stdcell_dir
+    if simulator == "openems":
+        # run_one_openems() needs the BLOCK's own free parameters (e.g.
+        # inner_radius_um/n_turns/track_width_um/spacing_um), not testbench
+        # placeholders sourced from config.json's global `defaults` -- every
+        # other simulator gets its block-specific values already baked into
+        # the materialized sch/<block>.sch (substitute_params(), see
+        # run_variation()) instead, so this merge is openems-only, not a
+        # general tb_params_base <- block_params channel.
+        tb_params_base.update(block_params or {})
     if sweep_axis:
         key, prefix = sweep_axis
         values = [float(v) for v in test_cfg.get("conditions", {}).get(key, [])]
@@ -1942,7 +2225,7 @@ def run_test(container, variation, test_name, test_cfg, defaults, ctx,
             outcome = runner(
                 container, test_name, tb_source, conditions, tb_params_base,
                 run_dir, f"{container_sim_dir}/{test_name}/{label}", container_rcfile, ctx,
-                n_threads=n_threads,
+                block_cfg=block_cfg, block=block, topology=topology, n_threads=n_threads,
             )
         append_run(variation, test_name, label, conditions, outcome)
         emit_progress_step()
@@ -2068,20 +2351,27 @@ def generate_plot(variation, test_name, test_cfg, defaults):
     runs = []
     for conditions in condition_matrix(test_cfg, defaults, sweep_axis):
         run_dir = test_dir / condition_label(conditions)
-        # Matches run_one_ngspice()/run_one_xyce()/run_one_netlist()'s own
-        # data_file naming exactly -- ngspice's `wrdata` and every Xyce
-        # testbench's `.print ... file=` both target the identical
-        # 'filename'_'N'.data convention (N is always "0", see run_test()'s
-        # tb_params_base; run_one_xyce() normalizes Xyce's own output to
-        # that same path/shape), so both share this branch. Only a
-        # "netlist" simulator test (e.g. area estimation) differs, reading
-        # the expanded .spice netlist text directly instead of a .data
-        # file -- if a future Xyce test's own .print line ever targets a
-        # different filename, this branch needs revisiting.
-        data_file = (
-            run_dir / f"{test_name}_0.data" if simulator != "netlist"
-            else run_dir / f"{tb_source.stem}.spice"
-        )
+        # Matches run_one_ngspice()/run_one_xyce()/run_one_netlist()/
+        # run_one_openems()'s own data_file naming exactly -- ngspice's
+        # `wrdata` and every Xyce testbench's `.print ... file=` both
+        # target the identical 'filename'_'N'.data convention (N is always
+        # "0", see run_test()'s tb_params_base; run_one_xyce() normalizes
+        # Xyce's own output to that same path/shape), so both share the
+        # ".data" branch. A "netlist" simulator test (e.g. area estimation)
+        # differs, reading the expanded .spice netlist text directly
+        # instead of a .data file. "openems" differs too -- run_one_openems()
+        # writes its cached Y11-sweep result as '<test_name>_0.json' (there
+        # is no ngspice/Xyce-style .data output at all for this simulator,
+        # the FDTD run itself IS the measurement) -- if a future Xyce
+        # test's own .print line ever targets a different filename, or a
+        # future simulator needs yet another convention, this branch needs
+        # revisiting again.
+        if simulator == "netlist":
+            data_file = run_dir / f"{tb_source.stem}.spice"
+        elif simulator == "openems":
+            data_file = run_dir / f"{test_name}_0.json"
+        else:
+            data_file = run_dir / f"{test_name}_0.data"
         if not data_file.exists():
             continue
         raw = parser_module.extract(data_file)
@@ -2462,6 +2752,7 @@ def run_variation(block_cfg, tests, defaults, params, force=False, container_ctx
                 result = run_test(
                     ctx.container, name, test_name, test_cfg, defaults, ctx,
                     sim_dir, container_sim_dir, container_rcfile,
+                    block_params=params, block_cfg=block_cfg, block=block, topology=topology,
                 )
                 test_elapsed = time.monotonic() - test_start_ts
                 if result["status"] == "error":

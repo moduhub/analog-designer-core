@@ -97,15 +97,17 @@ def schema_errors(param_defs):
 
 def derived_names(derived_cfg):
     """Every name a derived_parameters.width_groups, import_params,
-    import_metrics, OR formulas entry produces (e.g. 'm6_width', "top"'s own
-    'x1_m3_width'/'amp_bias_width'/'rbot_nominal'/'r1_length') -- these are
+    import_metrics, formulas, OR generator entry produces (e.g. 'm6_width',
+    "top"'s own 'x1_m3_width'/'amp_bias_width'/'rbot_nominal'/'r1_length',
+    a "generator"-backed topology's own 'l'/'rs'/'cox'/...) -- these are
     real schematic tokens with no entry of their own in `parameters` (their
     value comes from a group's base*factor, a pure import of another
-    block's own resolved value/stored metric, or a formulas entry's own
-    arithmetic expr instead -- see analog_designer.sim.run_sim.
+    block's own resolved value/stored metric, a formulas entry's own
+    arithmetic expr, or (generator) a project generator module's own
+    fit_electrical_params() -- see analog_designer.sim.run_sim.
     resolve_derived_params/resolve_import_params/resolve_import_metrics/
-    resolve_formulas), so check()'s used-but-not-declared check must not
-    flag them as missing."""
+    resolve_formulas/resolve_generator_params), so check()'s used-but-not-
+    declared check must not flag them as missing."""
     names = {
         name
         for group in (derived_cfg or {}).get("width_groups", [])
@@ -114,6 +116,7 @@ def derived_names(derived_cfg):
     names.update((derived_cfg or {}).get("import_params", {}))
     names.update((derived_cfg or {}).get("import_metrics", {}))
     names.update((derived_cfg or {}).get("formulas", {}))
+    names.update((derived_cfg or {}).get("generator", {}))
     return names
 
 
@@ -264,6 +267,19 @@ def derived_errors(param_defs, derived_cfg, used, sub_blocks=None):
                         f"width_groups/import_params/import_metrics/formulas derived name",
                     ))
         resolvable.add(name)
+    # "generator" entries have no base/factor/from/expr to validate (their
+    # value comes from a project generator module's own
+    # fit_electrical_params(), not from anything expressible here) -- just
+    # the same name-collision + staleness checks every other kind gets.
+    for name, entry in (derived_cfg or {}).get("generator", {}).items():
+        label = f"generator.{name}"
+        if name in param_defs:
+            errors.append((label, f"derived parameter {name!r} is also declared in parameters -- remove one"))
+        if name in seen:
+            errors.append((label, f"derived parameter {name!r} is produced by both {seen[name]!r} and {label!r}"))
+        seen[name] = label
+        if name not in used:
+            errors.append((label, f"derived parameter {name!r} isn't referenced in the schematic -- stale generator entry?"))
     return errors
 
 
@@ -354,7 +370,7 @@ def structural_sub_block_errors(param_defs, structural_sub_blocks):
     return errors
 
 
-def check(param_defs, sch_text, derived_cfg=None, sub_blocks=None, config=None, structural_sub_blocks=None):
+def check(param_defs, sch_text, derived_cfg=None, sub_blocks=None, config=None, structural_sub_blocks=None, generator_backed=False):
     """(orphans, missing, schema_errors) -- orphans/missing are sorted name
     lists, schema_errors is check() -> [(name, message), ...]. derived_cfg is
     a topology's `derived_parameters` (see derived_names/referenced_in_derived
@@ -365,13 +381,22 @@ def check(param_defs, sch_text, derived_cfg=None, sub_blocks=None, config=None, 
     validate a block_ref's own block/topology actually exist -- omit to
     skip that one check. structural_sub_blocks is the topology's own
     `structural_sub_blocks` (see structural_sub_block_errors()) -- omit for
-    a topology with none."""
+    a topology with none. generator_backed (True when block_cfg declares a
+    "generator", e.g. inductor.spiral) exempts EVERY declared parameter from
+    the orphan check -- a generator-backed topology's own `parameters` are
+    free GEOMETRIC inputs consumed by the generator module's own Python code
+    (geometry_from_params()), never literal '<name>' schematic tokens
+    themselves (only its `derived_parameters.generator` names are -- see
+    analog_designer.sim.run_sim.resolve_generator_params()), same reasoning
+    as block_ref_names()'s own exemption for "type": "block_ref" params, just
+    applying to the whole set at once instead of a per-parameter type tag."""
     used = used_params(sch_text)
     declared = set(param_defs)
     dnames = derived_names(derived_cfg)
     referenced = referenced_in_derived(derived_cfg)
     block_refs = block_ref_names(param_defs)
-    orphans = sorted((declared - used) - referenced - block_refs)
+    generator_inputs = declared if generator_backed else set()
+    orphans = sorted((declared - used) - referenced - block_refs - generator_inputs)
     missing = sorted((used - declared) - dnames)
     errors = (
         schema_errors(param_defs)
@@ -397,7 +422,10 @@ def main():
     structural_sub_blocks = block_cfg.get("structural_sub_blocks")
     sch_text = (workspace.PROJECT_ROOT / "sch" / block_cfg["schematic"]).read_text(encoding="utf-8")
 
-    orphans, missing, errors = check(param_defs, sch_text, derived_cfg, sub_blocks, workspace.CONFIG, structural_sub_blocks)
+    orphans, missing, errors = check(
+        param_defs, sch_text, derived_cfg, sub_blocks, workspace.CONFIG, structural_sub_blocks,
+        generator_backed="generator" in block_cfg,
+    )
 
     print(f"{workspace.BLOCK}/{workspace.TOPOLOGY}: {len(param_defs)} declared parameter(s), "
           f"{len(used_params(sch_text))} referenced in {block_cfg['schematic']}")

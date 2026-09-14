@@ -30,10 +30,15 @@ _MAX_ZOOM_OVER_FIT = 20.0
 
 
 class ZoomableImageView(ttk.Frame):
-    def __init__(self, master):
+    def __init__(self, master, popout=True):
+        """popout=False for the view INSIDE a pop-out window itself (see
+        _pop_out below) -- its own toolbar has no further "Pop out" button
+        to open yet another copy of the same image, that would just nest
+        identical windows with no benefit."""
         super().__init__(master)
         self._pil_image = None
         self._photo = None  # kept alive -- Tk drops a PhotoImage the moment nothing references it
+        self._path = None  # kept so _pop_out() can reload the same image into a fresh view
         self._zoom = 1.0
         self._offset_x = 0.0
         self._offset_y = 0.0
@@ -51,6 +56,8 @@ class ZoomableImageView(ttk.Frame):
         ttk.Button(toolbar, text="Fit", command=self.fit, width=6).pack(side="left", padx=(0, 4), pady=2)
         self.zoom_label_var = tk.StringVar(value="")
         ttk.Label(toolbar, textvariable=self.zoom_label_var, foreground="#888888").pack(side="left")
+        if popout:
+            ttk.Button(toolbar, text="Pop out", command=self._pop_out, width=8).pack(side="right", padx=(4, 0), pady=2)
 
         self.canvas.bind("<Configure>", self._on_resize)
         self.canvas.bind("<MouseWheel>", self._on_wheel)  # Windows/macOS
@@ -58,10 +65,12 @@ class ZoomableImageView(ttk.Frame):
         self.canvas.bind("<Button-5>", self._on_wheel)  # X11 scroll down
         self.canvas.bind("<ButtonPress-1>", self._on_press)
         self.canvas.bind("<B1-Motion>", self._on_drag)
+        self.canvas.bind("<Double-Button-1>", lambda _event: self._pop_out())
 
     def clear(self, message="(not generated yet)"):
         self._pil_image = None
         self._photo = None
+        self._path = None
         self.canvas.delete("all")
         self._empty_text_id = self.canvas.create_text(10, 10, anchor="nw", fill="#cccccc", text=message)
         self.zoom_label_var.set("")
@@ -75,7 +84,26 @@ class ZoomableImageView(ttk.Frame):
         except Exception:  # noqa: BLE001 -- a missing/corrupt snapshot shouldn't crash the GUI
             self.clear("(snapshot unavailable)")
             return
+        self._path = path
         self.fit()
+
+    def _pop_out(self):
+        """Opens the SAME image, freshly loaded, in its own resizable
+        Toplevel window at a larger default size -- lets someone inspect a
+        plot/snapshot full-size without it fighting the embedding panel's
+        own (often narrow) layout. Reloads from `self._path` rather than
+        reusing self._pil_image/self._photo -- a Tk PhotoImage can't be
+        shared across two Canvas widgets reliably, and the source PNG is
+        cheap to re-read. A no-op (double-click/button click does nothing)
+        when there's no image loaded yet -- nothing useful to pop out."""
+        if self._path is None:
+            return
+        win = tk.Toplevel(self)
+        win.title(str(self._path))
+        win.geometry("900x700")
+        view = ZoomableImageView(win, popout=False)
+        view.pack(fill="both", expand=True)
+        view.set_image(self._path)
 
     def _fit_zoom(self):
         if self._pil_image is None:
