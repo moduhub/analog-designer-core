@@ -2046,11 +2046,20 @@ def run_one_openems(container, test_name, tb_source, conditions, tb_params_base,
     # sibling name from data_path itself -- keep the two conventions in
     # sync if either ever changes.
     data_field_png = run_dir / f"{test_name}_0__field.png"
+    # Per-layer dumps (metal4/via4/substrate/...), 2026-09-15: same
+    # cache_dir/run_dir pairing as the single field.png above, but keyed by
+    # whatever labels the generator's own FIELD_DUMP_NAMES declares (see
+    # inductor_spiral_generator.py) -- "__field_<label>.png" siblings,
+    # matched by tb_yparam_spiral.py's extract() globbing for that pattern.
+    cache_field_png_dir = cache_dir / f"{cache_key}__field_dumps"
 
     if cache_file.exists():
         data_file.write_text(cache_file.read_text(encoding="utf-8"), encoding="utf-8")
         if cache_field_png.exists():
             data_field_png.write_bytes(cache_field_png.read_bytes())
+        if cache_field_png_dir.is_dir():
+            for cached_png in cache_field_png_dir.glob("*.png"):
+                (run_dir / f"{test_name}_0__field_{cached_png.stem}.png").write_bytes(cached_png.read_bytes())
         return {"status": "success", "data_file": data_file, "diagnostics": []}
 
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -2075,6 +2084,7 @@ def run_one_openems(container, test_name, tb_source, conditions, tb_params_base,
     container_params_json = f"{container_run_dir}/fitted.params.json"
     container_cache_json = f"{container_run_dir}/result.json"
     container_field_png = f"{container_run_dir}/field.png"
+    container_field_png_dir = f"{container_run_dir}/field_dumps"
     (run_dir / "geometry.json").write_text(json.dumps(geometry), encoding="utf-8")
 
     # Redirected straight to a file INSIDE container_run_dir (already
@@ -2099,7 +2109,7 @@ def run_one_openems(container, test_name, tb_source, conditions, tb_params_base,
         f'--generator "{container_generator_py}" --geometry-json "{container_geometry_json}" '
         f'--corner tt --f-max {_OPENEMS_F_MAX_HZ} '
         f'--out "{container_params_json}" --cache-out "{container_cache_json}" '
-        f'--field-png "{container_field_png}" '
+        f'--field-png "{container_field_png}" --field-png-dir "{container_field_png_dir}" '
         f'> "{container_log}" 2>&1'
     )
     sim_result = docker_exec(container, sim_cmd, timeout=sim_timeout + 30)
@@ -2130,6 +2140,16 @@ def run_one_openems(container, test_name, tb_source, conditions, tb_params_base,
     if out_field_png.exists():
         cache_field_png.write_bytes(out_field_png.read_bytes())
         data_field_png.write_bytes(out_field_png.read_bytes())
+    # Per-layer dumps (see container_field_png_dir above) -- same
+    # optional/best-effort posture as the single field.png: openems_generator_runner.py
+    # already skipped/logged anything that failed to render, so whatever
+    # shows up here (0 or more PNGs) is exactly what's available.
+    out_field_png_dir = run_dir / "field_dumps"
+    if out_field_png_dir.is_dir():
+        cache_field_png_dir.mkdir(parents=True, exist_ok=True)
+        for rendered_png in out_field_png_dir.glob("*.png"):
+            cache_field_png_dir.joinpath(rendered_png.name).write_bytes(rendered_png.read_bytes())
+            (run_dir / f"{test_name}_0__field_{rendered_png.stem}.png").write_bytes(rendered_png.read_bytes())
     return {"status": "success", "data_file": data_file, "diagnostics": []}
 
 

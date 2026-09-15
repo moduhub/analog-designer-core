@@ -179,6 +179,13 @@ def main():
                          help="Optional output path for a current-density-concentration PNG rendered from the "
                               "generator's own field dump (see render_field_dump()) -- best-effort: a render "
                               "failure is logged and skipped, never lets a real FDTD result go unsaved over it")
+    parser.add_argument("--field-png-dir", default=None,
+                         help="Optional output DIRECTORY for one current-density PNG per entry in the generator's "
+                              "own FIELD_DUMP_NAMES dict (e.g. metal5/metal4/via4/substrate -- see "
+                              "inductor_spiral_generator.py's own FIELD_DUMP_NAMES docstring for why a project may "
+                              "dump more than one layer). Written as '<dir>/<label>.png'. Generators without a "
+                              "FIELD_DUMP_NAMES attribute are skipped entirely (nothing to render); each entry is "
+                              "independently best-effort, same reasoning as --field-png")
     args = parser.parse_args()
 
     generator = _load_generator(args.generator)
@@ -210,6 +217,32 @@ def main():
                 print(f"No field dump found at {h5_path} -- skipping field PNG")
         except Exception as exc:  # noqa: BLE001 -- see comment above
             print(f"Field dump render failed (non-fatal, Y11 result unaffected): {exc}")
+
+    if args.field_png_dir:
+        # Same best-effort isolation as the single --field-png block above,
+        # per entry: one generator (e.g. inductor_spiral_generator.py) may
+        # dump metal5/metal4/via4/substrate all in the same run -- render
+        # whichever of those actually produced an .h5 (a generator whose
+        # FIELD_DUMP_NAMES only has 'metal5', like inductor_loop_generator.py,
+        # or an older generator with no FIELD_DUMP_NAMES at all, simply
+        # renders fewer/none here -- never an error on its own). This is
+        # ADDITIONAL to --field-png above, not a replacement -- that fixed
+        # single-path output (always the 'metal5' dump, by convention) is
+        # left completely alone so existing callers/cache-copy logic keep
+        # working unchanged.
+        dump_names = getattr(generator, "FIELD_DUMP_NAMES", {})
+        os.makedirs(args.field_png_dir, exist_ok=True)
+        for label, dump_name in dump_names.items():
+            png_path = os.path.join(args.field_png_dir, f"{label}.png")
+            try:
+                h5_path = os.path.join(sim_path, dump_name + ".h5")
+                if os.path.exists(h5_path):
+                    render_field_dump(h5_path, png_path)
+                    print(f"Field/current-density PNG ({label}) written to {png_path}")
+                else:
+                    print(f"No field dump found at {h5_path} -- skipping {label} field PNG")
+            except Exception as exc:  # noqa: BLE001 -- see comment above
+                print(f"Field dump render failed for {label} (non-fatal, Y11 result unaffected): {exc}")
 
     # numpy arrays/complex Y11 aren't JSON-serializable directly -- re/im as
     # plain float lists is what run_one_openems()'s own cache/data-file
