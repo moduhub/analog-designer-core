@@ -38,6 +38,7 @@ import hashlib
 import importlib.util
 import itertools
 import json
+import math
 import operator
 import os
 import re
@@ -646,8 +647,9 @@ def resolve_sub_block_params(config, sub_blocks, params):
             sub_params = _variation_params(chosen)
         else:
             sub_params = {n: pdef["default"] for n, pdef in sub_block_cfg["parameters"].items()}
-        resolved_by_instance[instance] = resolve_generator_params(
-            sub_block_cfg, resolve_derived_params(sub_block_cfg, sub_params)
+        resolved_by_instance[instance] = resolve_formulas(
+            sub_block_cfg,
+            resolve_generator_params(sub_block_cfg, resolve_derived_params(sub_block_cfg, sub_params)),
         )
     return resolved_by_instance
 
@@ -670,6 +672,13 @@ _FORMULA_UNARYOPS = {
     ast.UAdd: operator.pos,
     ast.USub: operator.neg,
 }
+#: One-argument functions a formula may call. ceil/floor tolerate 1e-9 of
+#: float noise so a ratio that is mathematically an integer never rounds
+#: the wrong way (e.g. 20u/10u evaluating to 2.0000000000000004 -> ceil 3).
+_FORMULA_FUNCS = {
+    "ceil": lambda x: math.ceil(x - 1e-9),
+    "floor": lambda x: math.floor(x + 1e-9),
+}
 
 
 def formula_names(expr):
@@ -680,13 +689,15 @@ def formula_names(expr):
     real declared/derived name, and to count it as real usage of a free
     parameter that's otherwise only ever consumed here, never as a literal
     schematic token)."""
-    return {node.id for node in ast.walk(ast.parse(expr, mode="eval")) if isinstance(node, ast.Name)}
+    tree = ast.parse(expr, mode="eval")
+    called = {node.func.id for node in ast.walk(tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
+    return {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)} - called
 
 
 def _eval_formula(expr, values):
     """Evaluate one derived_parameters.formulas `expr` against `values`
     ({name: float}, already parsed out of their SPICE-value strings) -- see
-    _FORMULA_BINOPS/_FORMULA_UNARYOPS above for exactly what's allowed."""
+    _FORMULA_BINOPS/_FORMULA_UNARYOPS/_FORMULA_FUNCS above for exactly what's allowed."""
     def _visit(node):
         if isinstance(node, ast.Expression):
             return _visit(node.body)
@@ -696,6 +707,8 @@ def _eval_formula(expr, values):
             return _FORMULA_UNARYOPS[type(node.op)](_visit(node.operand))
         if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
             return node.value
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in _FORMULA_FUNCS                 and len(node.args) == 1 and not node.keywords:
+            return _FORMULA_FUNCS[node.func.id](_visit(node.args[0]))
         if isinstance(node, ast.Name):
             return values[node.id]
         raise ValueError(f"unsupported expression node in formula {expr!r}: {ast.dump(node)}")
@@ -729,6 +742,11 @@ def resolve_formulas(block_cfg, params):
     literal after resolve_formulas() runs, exactly like every other derived
     kind (width_groups, import_params, import_metrics) already guarantees."""
     resolved = dict(params)
+    # derived_parameters.constants: named literals (e.g. w_finger_max) a
+    # formula's expr can reference -- declared in the topology's own JSON so
+    # nothing a formula depends on is hidden in Python or another file.
+    for name, entry in block_cfg.get("derived_parameters", {}).get("constants", {}).items():
+        resolved[name] = entry["value"]
     for name, entry in block_cfg.get("derived_parameters", {}).get("formulas", {}).items():
         values = {}
         for n, v in resolved.items():
@@ -1518,6 +1536,7 @@ RES_CORNER_SECTION = {
     "typ_mismatch": "res_typ_mismatch", "bcs_mismatch": "res_bcs_mismatch", "wcs_mismatch": "res_wcs_mismatch",
     "typ_stat": "res_typ_stat",
 }
+_RES_SECTION_CMOS5L = {"res_typ_stat": "res_stat"}
 
 
 def condition_matrix(test_cfg, defaults, sweep_axis):
@@ -1624,6 +1643,8 @@ def _netlist(container, test_name, tb_source, conditions, tb_params_base,
     for key, value in conditions.items():
         if key != "corner":
             tb_params[key] = value
+    if "vdd" in conditions:
+        tb_params["Vavdd"] = conditions["vdd"]  # outer vdd axis: keep the cmos_vref alias in step
     # Only a testbench that opts in by referencing 'res_corner' itself ever
     # has this key at all (from fixed_tb_params() for a single-valued
     # conditions.res_corner, or from the outer-axis copy above for a
@@ -1633,6 +1654,11 @@ def _netlist(container, test_name, tb_source, conditions, tb_params_base,
     # (existing) testbench, which never sets this key.
     if "res_corner" in tb_params:
         tb_params["res_corner"] = RES_CORNER_SECTION[tb_params["res_corner"]]
+        # CMOS5L's cornerRES.lib names its "typical + statistical" section
+        # res_stat (sg13g2: res_typ_stat) -- otherwise ngspice aborts with
+        # "section definition res_typ_stat not found".
+        if ctx.pdk_name == "ihp-sg13cmos5l":
+            tb_params["res_corner"] = _RES_SECTION_CMOS5L.get(tb_params["res_corner"], tb_params["res_corner"])
     tb_params["simpath"] = container_run_dir
 
     tb_text = substitute_params(tb_source.read_text(encoding="utf-8"), tb_params)
@@ -1842,6 +1868,47 @@ def xyce_plugin_so(pdk_name):
     return f"libXyce_Plugin_{pdk_name.replace('-', '_')}.so"
 
 
+_CMOMF_LINE_RE = re.compile(r"^(?P<name>[Xx]\S+)\s+(?P<plus>\S+)\s+(?P<minus>\S+)\s+cap_cmomf\s+(?P<params>.*)$")
+
+
+_CMOM_INSTANCE_RE = re.compile(r"^[Xx]\S+\s+.*\bcap_cmom[fi]\b")
+_CORNERCAP_LIB_RE = re.compile(r"^\.lib\s+\S*cornerCAP\.lib\b", re.IGNORECASE)
+
+
+def _lower_cmomf_for_xyce(netlist_path):
+    """Rewrite every `cap_cmomf` instance in an Xyce netlist as an ideal
+    capacitor of the same value. The IHP CMOS5L cap_cmomf is a Verilog-A/OSDI
+    model that only ngspice loads (Xyce's combined plugin is PSP103 + r3_cmc
+    + mosvar), but the device is a pure low-frequency capacitance --
+    C = m * areacap(mmin, mmax) * w * l, no series R/L, no substrate node --
+    so an ideal C is an exact equivalent (formula from the PDK's own
+    cap_cmomf.lib header, checked against ngspice's model: M1-M4 =
+    1.287 fF/um^2, M2-M3 = 0.61 fF/um^2):
+        areacap = base + (mmax - mmin) * 0.305  [fF/um^2],
+        base = 0.372 if mmin == 1 else 0.305."""
+    lines = netlist_path.read_text(encoding="utf-8").splitlines()
+    changed = False
+    for i, line in enumerate(lines):
+        match = _CMOMF_LINE_RE.match(line)
+        if not match:
+            continue
+        kv = dict(item.split("=", 1) for item in match.group("params").split() if "=" in item)
+        w_um = parse_spice_value(kv["w"]) * 1e6
+        l_um = parse_spice_value(kv["l"]) * 1e6
+        mmin, mmax = int(float(kv.get("mmin", 1))), int(float(kv.get("mmax", 4)))
+        m = float(kv.get("m", 1))
+        areacap = (0.372 if mmin == 1 else 0.305) + (mmax - mmin) * 0.305
+        farads = m * areacap * 1e-15 * w_um * l_um
+        lines[i] = f"C_{match.group('name')} {match.group('plus')} {match.group('minus')} {farads:.6e}"
+        changed = True
+    if changed:
+        # Xyce's PDK mirror ships no cornerCAP.lib (it only holds the OSDI
+        # cap models' cards), and nothing left in the netlist needs it.
+        if not any(_CMOM_INSTANCE_RE.match(line) for line in lines):
+            lines = [line for line in lines if not _CORNERCAP_LIB_RE.match(line)]
+        netlist_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def run_one_xyce(container, test_name, tb_source, conditions, tb_params_base,
                   run_dir, container_run_dir, container_rcfile, ctx,
                   block_cfg=None, block=None, topology=None, sim_timeout=290, n_threads=1):
@@ -1855,6 +1922,7 @@ def run_one_xyce(container, test_name, tb_source, conditions, tb_params_base,
         return netlist_result
     netlist_path = netlist_result
     _strip_ngspice_save_lines(netlist_path)
+    _lower_cmomf_for_xyce(netlist_path)
 
     # See run_one_ngspice's own identical line for why this must happen
     # before simulating, not just be checked for existence afterward.
@@ -1991,7 +2059,7 @@ def _openems_placeholder_cache_doc(generator, geometry, corner="tt", n_freq=_OPE
 
 def run_one_openems(container, test_name, tb_source, conditions, tb_params_base,
                      run_dir, container_run_dir, container_rcfile, ctx,
-                     block_cfg=None, block=None, topology=None, sim_timeout=36000, n_threads=1):
+                     block_cfg=None, block=None, topology=None, sim_timeout=172800, n_threads=1):
     """Runner for "generator"-backed topologies (e.g. inductor.spiral) --
     there is no xschem/.sch testbench at all (`tb_source` is unused; this
     test's config.json entry has no "testbench" key), the openEMS FDTD run
@@ -1999,6 +2067,19 @@ def run_one_openems(container, test_name, tb_source, conditions, tb_params_base,
     resolved geometry params (`tb_params_base`, the same resolved-parameter
     dict every other runner already receives): a FDTD run costs hours, so a
     second variation with identical geometry must not re-run it.
+
+    sim_timeout default is 172800s (48h), not the 290s every other runner
+    here uses -- bumped from an earlier 36000s (10h) default 2026-09-16
+    after it killed a real, cleanly-converging 40x10um/1um loop run mid-
+    flight (reached -20.47dB of the required -40dB EndCriteria, energy
+    still trending down, no instability) purely because it needed more
+    than 10h -- ~10h of compute lost for nothing (the raw port_it_*/
+    port_ut_* time-domain files survived and were separately recovered via
+    a direct CalcPort() call, skipping FDTD.Run() entirely, but that's a
+    manual recovery path, not something this runner does on its own).
+    Never passed explicitly by any call site (run_test()'s own `runner(...)`
+    call has no sim_timeout kwarg), so this default IS the effective value
+    for every real run -- keep that in mind if tuning it again.
 
     The generator script itself is project-specific GF180MCU code, so it
     lives in the OPEN PROJECT's own repo (block_cfg["generator"], a
@@ -2228,6 +2309,15 @@ def run_test(container, variation, test_name, test_cfg, defaults, ctx,
         tb_params_base[f"{prefix}_min"] = min(values)
         tb_params_base[f"{prefix}_max"] = max(values)
     tb_params_base.update(fixed_tb_params(test_cfg, tb_text, sweep_axis))
+    # A single-valued conditions.vdd (e.g. the informational *_1v8 twins of a
+    # 3v3 project) must actually reach the testbench: fixed_tb_params() skips
+    # "vdd" (see _NON_FIXED_CONDITION_KEYS), and cmos_vref's testbenches read
+    # the 'Vavdd' alias, which is otherwise frozen to defaults["vdd"]. A
+    # multi-valued list is either the internal sweep axis (line_reg's
+    # vdd_min/vdd_max, handled above) or an outer axis (see _netlist()).
+    vdd_values = test_cfg.get("conditions", {}).get("vdd")
+    if vdd_values and len(vdd_values) == 1 and not (sweep_axis and sweep_axis[0] == "vdd"):
+        tb_params_base["vdd"] = tb_params_base["Vavdd"] = vdd_values[0]
 
     test_dir = sim_dir / test_name
 
@@ -2495,13 +2585,17 @@ def setup_container(container):
     # yet, but costs nothing to load unconditionally and keeps this list a
     # straight mirror of the PDK's own reference file instead of a
     # per-device allowlist someone has to remember to extend again.
-    spiceinit_text = "\n".join([
-        f"osdi {osdi_dir}/psp103.osdi",
-        f"osdi {osdi_dir}/psp103_nqs.osdi",
-        f"osdi {osdi_dir}/r3_cmc.osdi",
-        f"osdi {osdi_dir}/mosvar.osdi",
-        "",
-    ])
+    osdi_names = ["psp103", "psp103_nqs", "r3_cmc", "mosvar"]
+    # cap_cmomi/cap_cmomf (MOM capacitors) only exist in the CMOS5L PDK (no
+    # MIM there), and their model cards live in cornerCAP.lib -- same "model
+    # type unresolvable without its OSDI loaded" failure as r3_cmc above
+    # ("Unable to find definition of model ...:cap_cmomf_mod"). Checked for
+    # existence instead of loaded unconditionally so sg13g2 (which ships no
+    # such objects) keeps its exact previous .spiceinit.
+    for optional in ("cap_cmomi", "cap_cmomf"):
+        if docker_exec(container, f'test -f "{osdi_dir}/{optional}.osdi"').returncode == 0:
+            osdi_names.append(optional)
+    spiceinit_text = "\n".join([f"osdi {osdi_dir}/{name}.osdi" for name in osdi_names] + [""])
     # Xyce's own PDK model-lib mirror -- differently-structured .lib files
     # than ngspice's despite matching filenames (Xyce's instantiate the
     # YPSP103_VA plugin device directly instead of loading OSDI), so a Xyce

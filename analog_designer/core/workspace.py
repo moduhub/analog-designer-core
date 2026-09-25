@@ -95,6 +95,7 @@ def resolve_parameters_files(root, config):
             topology["parameters"] = params_doc.get("parameters", {})
             topology["symmetry"] = params_doc.get("symmetry", {})
             topology["derived_parameters"] = params_doc.get("derived_parameters", {})
+            topology["layout"] = params_doc.get("layout", {})
 
 
 def container_image():

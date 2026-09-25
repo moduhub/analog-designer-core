@@ -77,20 +77,38 @@ def run_and_extract(generator, geometry, stack, sim_path, f_max_hz, n_freq=201):
 
     freqs = np.linspace(1e6, f_max_hz, n_freq)
     port.CalcPort(sim_path, freqs, ref_impedance=50)
-    # Conjugated: openEMS's DFT (utilities.DFT_time2freq) evidently uses the
-    # opposite time-convention (exp(+jwt), the physics/EM community's usual
-    # choice) from the exp(-jwt) circuit-theory convention this codebase's
-    # Q/SRF formulas assume. Un-conjugated, Re(Y11) comes out correctly
-    # positive everywhere (passivity holds) but Im(Y11) is POSITIVE across
-    # the whole sweep -- i.e. Im(1/Y11) negative, a capacitive-looking
-    # impedance already at 1MHz, unphysical for a structure that's
-    # overwhelmingly inductive at these dimensions. Conjugating flips only
-    # Im (Re, and thus passivity, is unaffected) and gives the expected
-    # smoothly-rising, always-positive Q(f) with no false early SRF. This
-    # is an openEMS-API property, not a PDK/geometry one -- applies to any
-    # generator using this same LumpedPort/CalcPort pattern, hence it lives
-    # here, not in the project's own module.
-    y11 = np.conj(port.if_tot / port.uf_tot)
+    # 2026-09-16: REMOVED a np.conj() that used to sit here -- reverting a
+    # fix from an earlier session (originally justified as correcting
+    # openEMS's DFT time-convention, exp(+jwt) vs. this codebase's exp(-jwt)
+    # circuit-theory assumption) that turns out to have been wrong for the
+    # in-line planar LumpedPort topology every current generator (spiral,
+    # loop) actually uses. That original validation was against a VERTICAL
+    # port design and, per this project's own later investigation, was
+    # likely only ever checked against Re(Y11)/DC resistance, never Im(Y11)'s
+    # sign -- see openems_inductor_status.md's "2026-09-15" and "2026-09-16"
+    # entries for the full trail. Decisive evidence this conjugate was
+    # backwards, from TWO independent, real FDTD runs on the SAME in-line
+    # planar port topology:
+    #   - 100x50um/2um loop (fully converged): WITH the conjugate, Im(Z11)
+    #     is negative and falling with no self-resonance across the whole
+    #     1MHz-20GHz sweep -- a pure-capacitor signature, physically absurd
+    #     for a modest-size Metal5 loop. WITHOUT it, Im(Z11) rises smoothly
+    #     and monotonically (0->29.6 ohm), Q rises smoothly (0->2.4), no
+    #     anomalies -- textbook lossy-inductor-below-SRF behavior. Also
+    #     independently confirmed correct via a REAL ngspice run of the
+    #     actual schematic (not just Python): y11_full_pi_model()'s closed
+    #     form matched real SPICE to 4e-9 relative error using the
+    #     UN-conjugated convention.
+    #   - 40x10um/1um loop (the ORIGINALLY-VALIDATED-for-Re(Y11)-only
+    #     default geometry, this time fully converged to -42.15dB): WITH
+    #     the conjugate, the low-frequency Z11 slope gives a NEGATIVE fitted
+    #     series inductance (-29.9pH) -- not just "off", sign-impossible for
+    #     a physical inductor, and it crashed downstream fitting code
+    #     (pi_model_fit.fit_eddy_branch()'s bounds assume l>0).
+    # Confirms the issue is a generic sign bug in this extraction, not a
+    # geometry-size-dependent physical effect (both a large and the
+    # original small/validated geometry show the identical pattern).
+    y11 = port.if_tot / port.uf_tot
 
     re = np.real(y11)
     im = np.imag(y11)
@@ -135,7 +153,25 @@ def render_field_dump(h5_path, png_path):
     z-slice the dump box spans (nz, usually 1-2 for a box matching one
     metal layer's own thickness) is averaged into one 2D image -- a
     thicker box would blur through-thickness variation, but for a single
-    thin metal layer that's not expected to matter."""
+    thin metal layer that's not expected to matter.
+
+    2026-09-16: crops the outermost ~15% of the dump box's own xy extent
+    (on each side) before plotting/color-scaling -- every current generator
+    (see add_field_dump()'s own box argument) sizes its dump box to match
+    the FULL simulation domain, whose own outer edge sits right at the
+    PML absorbing boundary. Confirmed on a real converged 40x10um/1um loop
+    substrate dump: a bright ring appeared right at the plotted edge
+    (~92% out from center), NOT at the loop's own footprint (~77% out for
+    that geometry) -- 60,000x weaker than the metal layer's own peak
+    current at the SAME color scale, and physically the wrong location to
+    be real loop-induced current. This is a PML-adjacent near-field/
+    imperfect-absorption artifact, not signal. Cropped by FRACTION of the
+    domain's own actual coordinate range (not a fixed index count or um
+    value) so this works for any geometry/mesh without needing to know the
+    structure's own physical size -- the mesh is non-uniformly graded
+    (fine near the structure, coarse near the boundary), so index-based
+    cropping would not correspond to a consistent physical margin the way
+    coordinate-based cropping does."""
     import h5py
     import numpy as np
     import matplotlib
@@ -151,6 +187,12 @@ def render_field_dump(h5_path, png_path):
     magnitude = np.sqrt(real ** 2 + imag ** 2)  # per-component |J|, shape (3, nz, ny, nx)
     total = np.sqrt(np.sum(magnitude ** 2, axis=0))  # combine x/y/z components -> (nz, ny, nx)
     total_2d = total.mean(axis=0)  # average over whatever z-slices the dump box spans -> (ny, nx)
+
+    crop_frac = 0.85
+    x_keep = np.abs(x_um) <= crop_frac * np.abs(x_um).max()
+    y_keep = np.abs(y_um) <= crop_frac * np.abs(y_um).max()
+    x_um, y_um = x_um[x_keep], y_um[y_keep]
+    total_2d = total_2d[np.ix_(y_keep, x_keep)]
 
     fig, ax = plt.subplots(figsize=(5, 5))
     im = ax.imshow(

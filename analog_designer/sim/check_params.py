@@ -48,7 +48,9 @@ def _formula_names(expr):
     (rather than imported) so this module's own "no docker/xschem" self-
     containment (see module docstring) doesn't grow a dependency on run_sim's
     much heavier materialization machinery just for this one AST walk."""
-    return {node.id for node in ast.walk(ast.parse(expr, mode="eval")) if isinstance(node, ast.Name)}
+    tree = ast.parse(expr, mode="eval")
+    called = {node.func.id for node in ast.walk(tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
+    return {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)} - called
 
 
 def _safe_formula_names(expr):
@@ -117,6 +119,7 @@ def derived_names(derived_cfg):
     names.update((derived_cfg or {}).get("import_metrics", {}))
     names.update((derived_cfg or {}).get("formulas", {}))
     names.update((derived_cfg or {}).get("generator", {}))
+    names.update((derived_cfg or {}).get("constants", {}))
     return names
 
 
@@ -234,6 +237,17 @@ def derived_errors(param_defs, derived_cfg, used, sub_blocks=None):
         missing = [k for k in ("test", "metric") if k not in entry]
         if missing:
             errors.append((label, f"missing {', '.join(missing)}"))
+    for name, entry in (derived_cfg or {}).get("constants", {}).items():
+        label = f"constants.{name}"
+        if name in param_defs:
+            errors.append((label, f"constant {name!r} is also declared in parameters -- remove one"))
+        if name in seen:
+            errors.append((label, f"constant {name!r} is produced by both {seen[name]!r} and {label!r}"))
+        seen[name] = label
+        if name not in used:
+            errors.append((label, f"constant {name!r} isn't referenced by any formula/schematic token -- stale constants entry?"))
+        if "value" not in entry:
+            errors.append((label, 'missing "value"'))
     # Names a formulas entry's own expr is allowed to reference: declared
     # parameters plus every width_groups/import_params/import_metrics
     # derived name already validated above, growing with each formula's own
