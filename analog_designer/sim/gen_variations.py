@@ -24,9 +24,9 @@ import traceback
 
 from analog_designer.core import workspace
 from analog_designer.sim.run_sim import (
-    BLOCK_REF_DEFAULT, _read_jsonl, emit_progress_total, emit_progress_total_seconds,
+    BLOCK_REF_DEFAULT, _read_jsonl, emit_progress_plan, emit_progress_trimmed,
     emit_progress_variation_done, ensure_variation_registered, historical_test_durations,
-    load_results, managed_container, plan_seconds, plan_steps, run_variation,
+    load_results, managed_container, plan_progress, run_variation,
     setup_container, trim_variation, validate_skip_on_fail_profile, validate_skip_on_fail_tolerance,
     variation_name,
 )
@@ -114,11 +114,11 @@ def random_params(param_defs, rng, spread_pct=None):
 
 
 #: checkpoint_size's own "auto" default (see _run_batch/_run_hierarchical_batch)
-#: is this multiplied by workspace.cpu_budget() -- e.g. 5 * 10 cores = checkpoint
-#: every 50 items. Chosen (not just 1x) so a checkpoint's own drain-the-chunk
+#: is this multiplied by workspace.cpu_budget() -- e.g. 3 * 10 cores = checkpoint
+#: every 30 items. Chosen (not just 1x) so a checkpoint's own drain-the-chunk
 #: barrier doesn't starve faster cores waiting on one chunk's slowest straggler
 #: too often -- purely a starting point, override with --checkpoint-size.
-DEFAULT_CHECKPOINT_MULTIPLIER = 5
+DEFAULT_CHECKPOINT_MULTIPLIER = 3
 
 
 def _run_batch(param_sets, block_cfg, tests, defaults, force, origin, skip_on_fail_profile=None,
@@ -202,26 +202,17 @@ def _run_batch(param_sets, block_cfg, tests, defaults, force, origin, skip_on_fa
     existing_names = {r["name"] for r in _read_jsonl(workspace.PROJECT_ROOT / "sim" / "variations.jsonl")}
     any_error = False
 
-    # Progress-bar total for the WHOLE batch, computed up front (pure file
-    # reads, no docker) -- one plan_steps() call per param set, reusing the
-    # exact freshness/condition-count logic run_variation() itself uses, so
-    # this can never drift from the real work each variation ends up doing.
+    # Progress plan for the WHOLE batch, computed up front (pure file
+    # reads, no docker) -- one plan_progress() call per param set, reusing
+    # the exact freshness/condition-count logic run_variation() itself uses,
+    # so this can never drift from the real work each variation ends up doing.
     existing_results = load_results()
-    emit_progress_total(sum(
-        plan_steps(
-            block_cfg, tests, defaults, existing_results,
-            variation_name(workspace.BLOCK, workspace.TOPOLOGY, params), force,
-        )
-        for params in param_sets
-    ))
     historical_durations = historical_test_durations(existing_results, workspace.BLOCK)
-    emit_progress_total_seconds(sum(
-        plan_seconds(
-            block_cfg, tests, defaults, existing_results,
-            variation_name(workspace.BLOCK, workspace.TOPOLOGY, params), force, historical_durations,
-        )
-        for params in param_sets
-    ))
+    for params in param_sets:
+        name = variation_name(workspace.BLOCK, workspace.TOPOLOGY, params)
+        emit_progress_plan(name, plan_progress(
+            block_cfg, tests, defaults, existing_results, name, force, historical_durations,
+        ))
 
     def _run_one(i, params):
         name = variation_name(workspace.BLOCK, workspace.TOPOLOGY, params)
@@ -280,6 +271,7 @@ def _run_batch(param_sets, block_cfg, tests, defaults, force, origin, skip_on_fa
         print(f"checkpoint: discarded {len(to_discard)} variation(s) that disqualified "
               f"{skip_on_fail_profile!r} beyond {skip_on_fail_max_failures} allowed failure(s) "
               f"({discarded_total} total so far): {', '.join(to_discard)}")
+        emit_progress_trimmed(to_discard)
         to_discard = []
 
     with managed_container() as container:
@@ -460,25 +452,16 @@ def _run_hierarchical_batch(jobs, defaults, force, skip_on_fail_profile=None,
     any_error = False
 
     existing_results = load_results()
-    emit_progress_total(sum(
-        plan_steps(
-            job["block_cfg"], job["tests"], defaults, existing_results,
-            variation_name(job["block"], job["topology"], job["params"]), force,
-        )
-        for job in jobs
-    ))
     # Recomputed per job (not cached per distinct block) -- a hierarchical
     # batch's job list is small (a handful of entries per `count` iteration)
     # and both functions are pure/cheap, not worth the extra bookkeeping of
     # a per-block cache for an input this size.
-    emit_progress_total_seconds(sum(
-        plan_seconds(
-            job["block_cfg"], job["tests"], defaults, existing_results,
-            variation_name(job["block"], job["topology"], job["params"]), force,
+    for job in jobs:
+        name = variation_name(job["block"], job["topology"], job["params"])
+        emit_progress_plan(name, plan_progress(
+            job["block_cfg"], job["tests"], defaults, existing_results, name, force,
             historical_test_durations(existing_results, job["block"]),
-        )
-        for job in jobs
-    ))
+        ))
 
     def _run_one(i, job):
         name = variation_name(job["block"], job["topology"], job["params"])
@@ -534,6 +517,7 @@ def _run_hierarchical_batch(jobs, defaults, force, skip_on_fail_profile=None,
         print(f"checkpoint: discarded {len(to_discard)} variation(s) (composed job(s) that disqualified "
               f"{skip_on_fail_profile!r} plus their own freshly-generated sub-blocks, {discarded_total} "
               f"total so far): {', '.join(to_discard)}")
+        emit_progress_trimmed(to_discard)
         to_discard = []
 
     # Both branches below chunk the SAME way: groups of `checkpoint_size`

@@ -1105,7 +1105,7 @@ def is_test_fresh(results, name, test_name, definition_hash):
 def _test_freshness(tests, block_cfg, existing_results, name, force):
     """(fresh_names, to_run_dict, definition_hashes) for one variation --
     single source of truth shared by run_variation() (which actually
-    simulates `to_run`) and plan_steps() (which only counts them, for a
+    simulates `to_run`) and plan_progress() (which only plans them, for a
     progress bar), so the two can never disagree about what's stale."""
     definition_hashes = {t: compute_definition_hash(block_cfg, cfg) for t, cfg in tests.items()}
     fresh = {
@@ -1116,25 +1116,14 @@ def _test_freshness(tests, block_cfg, existing_results, name, force):
     return fresh, to_run, definition_hashes
 
 
-def plan_steps(block_cfg, tests, defaults, existing_results, name, force):
-    """Number of (test, condition) simulation steps run_variation() would
-    actually perform for this variation right now, without running
-    anything -- reuses _test_freshness()/internal_sweep_axis()/
-    condition_matrix() so a progress bar's total can never drift from the
-    real work done. Pure (file reads only, no docker) -- cheap to call for
-    every variation in a batch before any simulation starts."""
-    _, to_run, _ = _test_freshness(tests, block_cfg, existing_results, name, force)
-    total = 0
-    for test_cfg in to_run.values():
-        tb_text = (workspace.PROJECT_ROOT / test_cfg["testbench"]).read_text(encoding="utf-8")
-        sweep_axis = internal_sweep_axis(test_cfg, tb_text)
-        total += len(list(condition_matrix(test_cfg, defaults, sweep_axis)))
-    return total
+def _n_conditions(test_cfg, defaults):
+    tb_text = (workspace.PROJECT_ROOT / test_cfg["testbench"]).read_text(encoding="utf-8")
+    return len(list(condition_matrix(test_cfg, defaults, internal_sweep_axis(test_cfg, tb_text))))
 
 
 def historical_test_durations(results, block):
     """{test_name: mean(duration_seconds)} mined from `results` rows for
-    `block` -- the data plan_seconds() below turns into an upfront ETA.
+    `block` -- the data plan_progress() below turns into progress weights.
     Pooled across every topology of `block` rather than kept separate per
     topology: config["tests"][block] is declared once per block, shared by
     every topology (same testbench/parser, just a different materialized
@@ -1152,9 +1141,9 @@ def historical_test_durations(results, block):
     every average toward zero the moment any history predates this field.
     A test skipped by --skip-on-fail is never append_results()'d at all
     (see run_variation()'s own skip_on_fail_profile branch), so it contributes zero
-    samples here too, never a wrong/short one -- this is exactly why this
-    MVP mean doesn't need to separately model skip-on-fail's own early-exit
-    probability."""
+    samples here too, never a wrong/short one -- a skipped test shows up
+    on the GUI side as its own gray segment instead (see
+    emit_progress_skipped())."""
     samples = {}
     for row in results:
         if row.get("block") != block or row.get("duration_seconds") is None:
@@ -1167,44 +1156,77 @@ def historical_test_durations(results, block):
     }
 
 
-def plan_seconds(block_cfg, tests, defaults, existing_results, name, force, historical_durations):
-    """Estimated total seconds run_variation() would spend on this
-    variation's own to_run tests right now, from historical_durations (see
-    historical_test_durations() above) -- the seconds-based counterpart to
-    plan_steps()'s step count, feeding emit_progress_total_seconds(). NOT
-    scaled by condition_matrix() the way plan_steps() is: a test's own
-    historical average already reflects however many conditions it
-    typically runs, since run_variation() times the whole run_test() call
-    once per test (every one of its conditions included), not per
-    condition. A test with no historical sample yet silently contributes
-    0.0 -- an under-estimate, not an error; see
-    emit_progress_total_seconds()'s own docstring for why that's the right
-    default over refusing to emit a total at all."""
+def plan_progress(block_cfg, tests, defaults, existing_results, name, force, historical_durations):
+    """[(test_name, n_conditions, est_seconds), ...] for every test
+    run_variation() would actually simulate for this variation right now,
+    without running anything -- reuses _test_freshness()/_n_conditions() so
+    the GUI's progress plan can never drift from the real work done. Pure
+    (file reads only, no docker) -- cheap to call for every variation in a
+    batch before any simulation starts. Feeds emit_progress_plan().
+
+    est_seconds comes from historical_durations (see
+    historical_test_durations() above) -- NOT scaled by the condition count:
+    a test's own historical average already reflects however many
+    conditions it runs, since run_variation() times the whole run_test()
+    call once per test. A test with no sample of its own yet falls back to
+    the per-condition mean of the tests that DO have one (x its own
+    condition count). With no history at all for this block, est_seconds
+    is None -- the GUI then weighs every condition equally (plain step
+    counting, the old behavior) and shows no ETA until real steps arrive.
+    Never 0: a zero-weight test would be invisible on the bar and in the ETA."""
     _, to_run, _ = _test_freshness(tests, block_cfg, existing_results, name, force)
-    return sum(historical_durations.get(t, 0.0) for t in to_run)
+    entries = [(t, _n_conditions(cfg, defaults)) for t, cfg in to_run.items()]
+    known = [
+        (historical_durations[t], _n_conditions(tests[t], defaults))
+        for t in historical_durations if t in tests
+    ]
+    known_conditions = sum(n for _, n in known)
+    if not known_conditions:
+        return [(t, n, None) for t, n in entries]
+    per_condition = sum(s for s, _ in known) / known_conditions
+    return [
+        (t, n, historical_durations[t] if t in historical_durations else per_condition * n)
+        for t, n in entries
+    ]
 
 
 def _progress_enabled():
     return os.environ.get("ANALOG_DESIGNER_PROGRESS") == "1"
 
 
-def emit_progress_total(n):
-    """Printed once, up front, by whichever entry point (main() for a
-    single Update, gen_variations._run_batch() for every batch path) knows
-    the full job's step count before simulating anything -- see plan_steps().
-    Gated behind ANALOG_DESIGNER_PROGRESS so a plain CLI invocation's output
-    is unchanged; analog_designer/gui/run_trigger.py sets it for GUI-launched jobs."""
+def emit_progress_plan(variation, entries):
+    """Printed up front, once per (variation, test) a job will simulate, by
+    whichever entry point (main() for a single Update,
+    gen_variations._run_batch()/_run_hierarchical_batch() for every batch
+    path) knows the full job before simulating anything -- see
+    plan_progress() for `entries`. The GUI sizes each test's slice of the
+    progress bar by est_seconds, split evenly across its n_conditions
+    STEP lines. Gated behind ANALOG_DESIGNER_PROGRESS so a plain CLI
+    invocation's output is unchanged; analog_designer/gui/run_trigger.py
+    sets it for GUI-launched jobs."""
     if _progress_enabled():
-        print(f"@PROGRESS TOTAL {n}")
+        for test_name, n_conditions, est_seconds in entries:
+            est = "-" if est_seconds is None else f"{est_seconds:.3f}"
+            print(f"@PROGRESS PLAN {variation} {test_name} {n_conditions} {est}")
 
 
-def emit_progress_step():
+def emit_progress_step(variation, test_name, ok):
     """Printed once per completed (test, condition) simulation attempt --
     see run_test()'s condition loop. Counts every attempt, success or not,
-    matching exactly what plan_steps() counted so the total is never
-    over/undershot."""
+    matching exactly what plan_progress() counted; `ok` picks the green vs
+    red segment of the GUI's bar."""
     if _progress_enabled():
-        print("@PROGRESS STEP")
+        print(f"@PROGRESS STEP {variation} {test_name} {'ok' if ok else 'fail'}")
+
+
+def emit_progress_testfail(variation, test_name):
+    """Printed when a whole test ends up "error" AFTER its conditions were
+    stepped (every condition failed, or extract()/evaluate() raised) -- the
+    GUI recolors that test's already-green steps red, since a condition
+    that simulated fine but whose test produced no result is still a
+    failure from the reader's point of view."""
+    if _progress_enabled():
+        print(f"@PROGRESS TESTFAIL {variation} {test_name}")
 
 
 def emit_progress_container(container_id):
@@ -1239,38 +1261,28 @@ def emit_progress_running(variation, test_name, label):
         print(f"@PROGRESS RUNNING {variation} {test_name} {label}")
 
 
-def emit_progress_skipped(n):
-    """Printed once, right before a skip_on_fail_profile break (see
-    run_variation()'s own per-test loop) -- plan_steps()/emit_progress_total()
-    compute an UPPER BOUND for the whole job (every planned test running to
-    completion), since at planning time nothing is known yet about which
-    tests would disqualify whichever profile --skip-on-fail is targeting.
-    skip_on_fail_profile's break means the REALIZED total for
-    this one variation is smaller, so `n` (a step count -- test x condition
-    pairs, exactly what emit_progress_step()/plan_steps() already count, NOT
-    a variation count or a duration) is how that shrinkage gets reconciled
-    on the GUI side (see app.py's own @PROGRESS SKIPPED handling) instead of
-    leaving the progress bar permanently short of 100% once the job actually
+def emit_progress_skipped(variation, test_names):
+    """Printed when planned tests of `variation` will never run -- a
+    skip_on_fail_profile break (the tests after the disqualifying one, see
+    run_variation()'s own per-test loop) or a StaleParameterSchema skip
+    (all of them). emit_progress_plan() is an UPPER BOUND (every planned
+    test running to completion), so this is how the GUI fills those tests'
+    slices gray instead of leaving the bar short of 100% once the job
     finishes. Gated behind ANALOG_DESIGNER_PROGRESS like every other
     @PROGRESS line."""
-    if _progress_enabled():
-        print(f"@PROGRESS SKIPPED {n}")
+    if _progress_enabled() and test_names:
+        print(f"@PROGRESS SKIPPED {variation} {' '.join(test_names)}")
 
 
-def emit_progress_total_seconds(seconds):
-    """Printed once, right after emit_progress_total() -- see plan_seconds()
-    for how `seconds` is computed from historical per-test durations mined
-    from results.jsonl. Gives analog_designer/gui/app.py a real ETA to show from
-    the very first poll tick, before any STEP/DONE line exists yet to drive
-    the original elapsed/done-based estimate. `seconds` is 0.0 when no
-    historical duration data exists at all for anything this job plans to
-    run (a fresh project, or every prior result predates duration_seconds
-    tracking) -- the GUI treats that identically to "no estimate," i.e.
-    today's blank-until-first-real-progress behavior, so this is purely
-    additive and never regresses that case. Gated behind
-    ANALOG_DESIGNER_PROGRESS like every other @PROGRESS line."""
-    if _progress_enabled():
-        print(f"@PROGRESS TOTAL_SECONDS {seconds:.1f}")
+def emit_progress_trimmed(names):
+    """Printed right after a discard-on-fail checkpoint trim_variation()'d
+    `names` (see gen_variations._run_batch/_run_hierarchical_batch's own
+    _checkpoint()) -- the GUI only ever adds/updates Variations table rows
+    mid-job, so without this the discarded rows would linger on screen until
+    the whole batch ends. Gated behind ANALOG_DESIGNER_PROGRESS like every
+    other @PROGRESS line."""
+    if _progress_enabled() and names:
+        print(f"@PROGRESS TRIMMED {' '.join(names)}")
 
 
 def emit_progress_variation_done(variation, elapsed_seconds, any_error):
@@ -2494,7 +2506,7 @@ def run_test(container, variation, test_name, test_cfg, defaults, ctx,
                 block_cfg=block_cfg, block=block, topology=topology, n_threads=n_threads,
             )
         append_run(variation, test_name, label, conditions, outcome)
-        emit_progress_step()
+        emit_progress_step(variation, test_name, outcome["status"] == "success")
         return conditions, outcome
 
     # One ThreadPoolExecutor per test, fanning out every condition of THIS
@@ -3021,15 +3033,16 @@ def run_variation(block_cfg, tests, defaults, params, force=False, container_ctx
                 container_rcfile = f"{workspace.container_project_root()}/xschemrc"
         except StaleParameterSchema as exc:
             print(f"{log_prefix}{name}: SKIPPED (pre-migration parameter schema, see {exc})")
+            emit_progress_skipped(name, list(to_run))
             emit_progress_variation_done(name, time.monotonic() - start_ts, any_error)
             return {"variation": name, "any_error": any_error, "discard": discard}
 
         git_commit, git_dirty = git_info()
         # A list, not the plain dict-items() iteration this used to be, so a
         # skip_on_fail_profile break below can slice "everything not yet
-        # reached" (to_run_items[i + 1:]) to tell the GUI exactly how many
-        # planned steps just got shrunk off the upfront total -- see
-        # emit_progress_skipped()'s own docstring.
+        # reached" (to_run_items[i + 1:]) to tell the GUI exactly which
+        # planned tests will now never run -- see emit_progress_skipped()'s
+        # own docstring.
         to_run_items = list(to_run.items())
         # block_cfg (this function's own parameter) is TOPOLOGY-scoped
         # (config["blocks"][block]["topologies"][topology]) and has no
@@ -3057,6 +3070,7 @@ def run_variation(block_cfg, tests, defaults, params, force=False, container_ctx
                 test_elapsed = time.monotonic() - test_start_ts
                 if result["status"] == "error":
                     print(f"{log_prefix}  {test_name}: ERROR ({result['error']})")
+                    emit_progress_testfail(name, test_name)
                     any_error = True
                     continue
                 append_results(
@@ -3085,18 +3099,9 @@ def run_variation(block_cfg, tests, defaults, params, force=False, container_ctx
                     max_failures=skip_on_fail_max_failures,
                 ):
                     # Every test from here on was planned into the upfront
-                    # emit_progress_total() but will now never run -- same
-                    # condition_matrix()/internal_sweep_axis() calls
-                    # plan_steps() itself uses, so this can never drift from
-                    # what the GUI's total was actually counting.
-                    remaining = sum(
-                        len(list(condition_matrix(
-                            cfg, defaults,
-                            internal_sweep_axis(cfg, (workspace.PROJECT_ROOT / cfg["testbench"]).read_text(encoding="utf-8")),
-                        )))
-                        for _, cfg in to_run_items[i + 1:]
-                    )
-                    emit_progress_skipped(remaining)
+                    # emit_progress_plan() but will now never run -- the GUI
+                    # fills their slices gray.
+                    emit_progress_skipped(name, [t for t, _ in to_run_items[i + 1:]])
                     if discard_on_fail:
                         discard = True
                         print(f"{log_prefix}  DISCARDING: {test_name} disqualifies profile {skip_on_fail_profile!r} "
@@ -3222,9 +3227,8 @@ def main():
 
     name = variation_name(workspace.BLOCK, workspace.TOPOLOGY, params)
     existing_results = load_results()
-    emit_progress_total(plan_steps(block_cfg, tests, defaults, existing_results, name, args.force))
     historical_durations = historical_test_durations(existing_results, workspace.BLOCK)
-    emit_progress_total_seconds(plan_seconds(block_cfg, tests, defaults, existing_results, name, args.force, historical_durations))
+    emit_progress_plan(name, plan_progress(block_cfg, tests, defaults, existing_results, name, args.force, historical_durations))
     outcome = run_variation(
         block_cfg, tests, defaults, params, force=args.force, skip_on_fail_profile=args.skip_on_fail,
         skip_on_fail_max_failures=args.skip_on_fail_max_failures, discard_on_fail=args.discard_on_fail,

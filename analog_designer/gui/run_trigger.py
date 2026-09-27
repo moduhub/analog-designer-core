@@ -75,7 +75,7 @@ class RunTrigger:
         # frozen and then dumps everything at once at the end -- not a
         # polling/queue issue on this side at all.
         # ANALOG_DESIGNER_PROGRESS=1 turns on run_sim.py's "@PROGRESS ..."
-        # lines (see its emit_progress_total/emit_progress_step) -- only for
+        # lines (see its emit_progress_plan/emit_progress_step) -- only for
         # GUI-launched jobs, so a bare CLI invocation's output is unchanged.
         env = dict(os.environ, PYTHONUNBUFFERED="1", ANALOG_DESIGNER_PROGRESS="1")
         prevent_sleep()

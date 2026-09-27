@@ -80,12 +80,20 @@ from analog_designer.gui.create_variation_dialog import ask_create_variation
 from analog_designer.gui.docker_settings_dialog import show_docker_settings
 from analog_designer.gui.parameters_panel import ParametersPanel
 from analog_designer.gui.problems_panel import ProblemsPanel
+from analog_designer.gui.progress_tracker import ProgressTracker
 from analog_designer.gui.run_options_dialog import ask_run_confirm
 from analog_designer.gui.run_trigger import MANUAL_VARIATION_MODULE, RUN_SIM_MODULE, RunTrigger
 from analog_designer.gui.variation_detail import VariationDetail
 from analog_designer.gui.variations_table import VariationsTable
 
 POLL_INTERVAL_MS = 200
+# Progress bar segments (see _paint_progress_bar) -- simulated ok / failed
+# (same red as the "finished WITH ERRORS" status line) / planned but never run.
+PROGRESS_OK = "#3a9d5d"
+PROGRESS_FAIL = "#c0392b"
+PROGRESS_SKIP = "#a0a0a0"
+PROGRESS_TROUGH = "#e6e6e6"
+PROGRESS_BORDER = "#bcbcbc"
 NEW_ROW_POLL_INTERVAL_MS = 1000  # deliberately much slower than POLL_INTERVAL_MS -- see App._poll_new_variations
 _SLOW_ROW_THRESHOLD_S = 30  # elapsed time on an in-flight variation's row past which it's flagged "slow" (see VariationsTable.set_running) -- see App._refresh_running_rows
 
@@ -130,10 +138,7 @@ class App(ttk.Frame):
         self._active_job = None  # "update" | "update_range" | "create" | None -- a pro subclass adds several more job kinds of its own
         self._variations_before_job = set()
         self._show_all_topologies = False  # Topology dropdown == ALL_TOPOLOGIES -- widens the table only, see ALL_TOPOLOGIES
-        self._progress_total = 0  # 0 = no @PROGRESS TOTAL seen yet this job -- bar/label stay idle
-        self._progress_done = 0
-        self._progress_total_seconds = 0.0  # 0 = no @PROGRESS TOTAL_SECONDS seen yet (no historical duration data, or an old GUI-less run_sim.py) -- see _update_progress_label
-        self._job_start_ts = None
+        self._progress = ProgressTracker()  # replaced per job in _start_job -- idle (no PLAN lines) until a simulation job starts
         # {variation: {"test_name": "<test>", "start_ts": monotonic}} for
         # every variation the current batch job has *in flight* right now
         # (see _handle_progress_running/_refresh_running_rows) -- a dict, not
@@ -242,19 +247,23 @@ class App(ttk.Frame):
         self.status_label.pack(side="right")
 
     def _build_progress_bar(self):
-        """Determinate progress bar + "done/total (pct%) - ETA mm:ss" label,
-        driven entirely by "@PROGRESS TOTAL n"/"@PROGRESS STEP" lines a
-        simulation job prints (see analog_designer/sim/run_sim.py's emit_progress_total/
-        emit_progress_step) -- _log() intercepts and consumes those lines
-        before they ever reach the console below. A job that never emits one
-        just leaves this idle at 0/blank -- status_var (set in _start_job)
-        is still the only indicator for those."""
+        """Three-color progress bar + "done/total (pct%) · N failed · N
+        skipped · ETA mm:ss" label, driven entirely by the "@PROGRESS PLAN/
+        STEP/TESTFAIL/SKIPPED" lines a simulation job prints (see
+        analog_designer/gui/progress_tracker.py for how they become
+        weighted ok/fail/skip fractions) -- _log() intercepts and consumes
+        those lines before they ever reach the console below. A plain
+        Canvas rather than ttk.Progressbar, which can only draw one fill
+        color. A job that never emits a PLAN line just leaves this idle at
+        empty/blank -- status_var (set in _start_job) is still the only
+        indicator for those."""
         frame = ttk.Frame(self)
         frame.pack(side="top", fill="x", padx=4, pady=(0, 4))
-        self.progress_bar = ttk.Progressbar(frame, mode="determinate", maximum=100)
-        self.progress_bar.pack(side="left", fill="x", expand=True)
+        self.progress_canvas = tk.Canvas(frame, height=14, highlightthickness=0, background=PROGRESS_TROUGH)
+        self.progress_canvas.pack(side="left", fill="x", expand=True)
+        self.progress_canvas.bind("<Configure>", lambda _e: self._paint_progress_bar())
         self.progress_label_var = tk.StringVar(value="")
-        ttk.Label(frame, textvariable=self.progress_label_var, width=28, anchor="e").pack(side="left", padx=(8, 0))
+        ttk.Label(frame, textvariable=self.progress_label_var, width=48, anchor="e").pack(side="left", padx=(8, 0))
         # No separate "currently running" label here -- under
         # workspace.cpu_budget() > 1 several variations are genuinely in
         # flight at once, and one shared label can only ever show whichever
@@ -493,12 +502,8 @@ class App(ttk.Frame):
         # exactly which variation(s) this job produced -- one for Update,
         # possibly many for a Create Monte Carlo batch.
         self._variations_before_job = {v["name"] for v in data.load_variations(all_topologies=True)}
-        self._progress_total = 0
-        self._progress_done = 0
-        self._progress_total_seconds = 0.0
-        self._job_start_ts = time.monotonic()
-        self.progress_bar["value"] = 0
-        self.progress_label_var.set("")
+        self._progress = ProgressTracker(cpu_budget=workspace.cpu_budget())
+        self._paint_progress()
         self._clear_running()
         self._set_busy(True)
         self.status_label.configure(foreground="")
@@ -759,6 +764,10 @@ class App(ttk.Frame):
         self._active_job = None
         self._set_busy(False)
         self._freeze_interrupted_running()
+        # Clean exit: whatever's still unfilled was planned but never ran
+        # (gray) -- the bar always ends at 100%. Cancel/crash: left as is.
+        self._progress.finish(returncode == 0)
+        self._paint_progress()
         self.reload()
         # A non-zero exit means SOMETHING went wrong -- anywhere from "one
         # simulation failed its spec" (routine, but still worth flagging) to
@@ -790,6 +799,8 @@ class App(ttk.Frame):
     def _poll_run(self):
         self.trigger.poll()
         self._refresh_running_rows()
+        if self._active_job is not None and self._progress.active:
+            self.progress_label_var.set(self._progress.label())  # ETA counts down between steps too
         self.after(POLL_INTERVAL_MS, self._poll_run)
 
     def _log(self, line):
@@ -813,92 +824,43 @@ class App(ttk.Frame):
         self.console.configure(state="disabled")
 
     def _consume_progress_line(self, line):
-        """"@PROGRESS TOTAL n"/"@PROGRESS TOTAL_SECONDS s"/"@PROGRESS STEP"/
-        "@PROGRESS SKIPPED n"/"@PROGRESS RUNNING ..."/"@PROGRESS DONE ..."
-        from a job's subprocess (see analog_designer/sim/run_sim.py's
-        emit_progress_total/emit_progress_total_seconds/emit_progress_step/
-        emit_progress_skipped/emit_progress_running/emit_progress_variation_done)
-        drive the progress bar/label and the Variations table's own per-row
-        live status instead of the console -- True if `line` was one of
-        these (caller skips logging it), False for every ordinary line."""
+        """"@PROGRESS PLAN/STEP/TESTFAIL/SKIPPED ..." (self._progress, see
+        ProgressTracker) and "@PROGRESS RUNNING/DONE/TRIMMED ..." from a job's
+        subprocess (see analog_designer/sim/run_sim.py's emit_progress_*
+        functions) drive the progress bar/label and the Variations table's
+        own per-row live status instead of the console -- True if `line`
+        was one of these (caller skips logging it), False for every
+        ordinary line."""
         if line.startswith("@PROGRESS RUNNING "):
             self._handle_progress_running(line[len("@PROGRESS RUNNING "):])
             return True
         if line.startswith("@PROGRESS DONE "):
             self._handle_progress_done(line[len("@PROGRESS DONE "):])
             return True
-        if line.startswith("@PROGRESS TOTAL_SECONDS "):
-            try:
-                self._progress_total_seconds = float(line.rsplit(" ", 1)[-1])
-            except ValueError:
-                return False
-            self._update_progress_label()
+        if line.startswith("@PROGRESS TRIMMED "):
+            self._handle_progress_trimmed(line[len("@PROGRESS TRIMMED "):].split())
             return True
-        if line.startswith("@PROGRESS SKIPPED "):
-            try:
-                n = int(line.rsplit(" ", 1)[-1])
-            except ValueError:
-                return False
-            # Clamped so a skip can never push the total below what's
-            # already done -- which would send the percentage past 100% or
-            # negative -- defensive against a malformed/duplicated line, not
-            # a case run_sim.py's own accounting should ever actually produce.
-            self._progress_total = max(self._progress_done, self._progress_total - n)
-            self._update_progress_label()
+        if self._progress.feed(line):
+            self._paint_progress()
             return True
+        return False
 
-        if line == "@PROGRESS STEP":
-            self._progress_done += 1
-        elif line.startswith("@PROGRESS TOTAL "):
-            try:
-                self._progress_total = int(line.rsplit(" ", 1)[-1])
-            except ValueError:
-                return False
-        else:
-            return False
+    def _paint_progress(self):
+        self._paint_progress_bar()
+        self.progress_label_var.set(self._progress.label())
 
-        self._update_progress_label()
-        return True
-
-    def _update_progress_label(self):
-        """Repaints the progress bar + its text label from current
-        self._progress_total/_progress_done/_progress_total_seconds -- called
-        from every branch above that can change one of them (TOTAL, STEP,
-        SKIPPED, TOTAL_SECONDS), factored out so all four stay consistent
-        instead of each inlining its own copy of this math.
-
-        Once self._progress_done > 0, the LIVE elapsed-based estimate
-        (today's original formula) always wins over the historical one, even
-        if _progress_total_seconds is also set: it reflects this run's own
-        actual pace under today's real conditions (machine load,
-        workspace.cpu_budget() contention, whichever corner/condition mix
-        this particular batch happens to be running) -- a fixed historical
-        average can't adapt to any of that. A blend of the two was
-        considered and rejected for exactly this reason: it would risk
-        anchoring the shown number away from where it's visibly, verifiably
-        heading as real STEP lines arrive.
-
-        The historical estimate (_progress_total_seconds) is used ONLY to
-        fill the "before any real data exists" gap -- previously blank -- and
-        is shown with an "(est.)" suffix so it reads as distinct from the
-        live number. It is set once, when TOTAL_SECONDS arrives, and stays
-        static until the first STEP line replaces it with the live estimate
-        -- this mirrors the existing ETA's own refresh cadence (already only
-        updated on @PROGRESS line arrival, not on _poll_run's 200ms tick),
-        not a new staleness problem introduced here."""
-        if self._progress_total <= 0:
-            return
-        pct = 100 * self._progress_done / self._progress_total
-        self.progress_bar["value"] = pct
-        eta_text = ""
-        if self._progress_done > 0:
-            elapsed = time.monotonic() - self._job_start_ts
-            eta = elapsed / self._progress_done * (self._progress_total - self._progress_done)
-            eta_text = f" - ETA {int(eta // 60):02d}:{int(eta % 60):02d}"
-        elif self._progress_total_seconds > 0:
-            eta = self._progress_total_seconds
-            eta_text = f" - ETA {int(eta // 60):02d}:{int(eta % 60):02d} (est.)"
-        self.progress_label_var.set(f"{self._progress_done}/{self._progress_total} ({pct:.0f}%){eta_text}")
+    def _paint_progress_bar(self):
+        """Green/red/gray segments stacked left to right, each sized by its
+        share of the job's estimated time (ProgressTracker.fractions())."""
+        canvas = self.progress_canvas
+        canvas.delete("all")
+        width, height = canvas.winfo_width(), canvas.winfo_height()
+        x = 0.0
+        for fraction, color in zip(self._progress.fractions(), (PROGRESS_OK, PROGRESS_FAIL, PROGRESS_SKIP)):
+            if fraction > 0:
+                canvas.create_rectangle(x, 0, x + fraction * width, height, fill=color, width=0)
+                x += fraction * width
+        canvas.create_rectangle(0, 0, width - 1, height - 1, outline=PROGRESS_BORDER)
 
     def _handle_progress_running(self, rest):
         """rest is "<variation> <test> <label>" (see run_sim.emit_progress_running)
@@ -948,6 +910,8 @@ class App(ttk.Frame):
         except ValueError:
             return
         self._running.pop(variation, None)
+        self._progress.variation_done(variation)
+        self._paint_progress()
         symbol = "✓" if status == "ok" else "✗"  # check / cross
         self._last_run_status[variation] = f"{symbol} {elapsed:.0f}s"
         self.table.set_done(variation, self._last_run_status[variation])
@@ -956,6 +920,17 @@ class App(ttk.Frame):
             self.detail.mark_running_test(None)
             self.detail.show(variation)
             self.params_panel.show(variation)
+
+    def _handle_progress_trimmed(self, names):
+        """A discard-on-fail checkpoint just deleted `names` (see
+        run_sim.emit_progress_trimmed) -- drop their rows now instead of
+        leaving them on screen until the batch's own end-of-job reload().
+        A full reload() rather than a per-row delete: checkpoints are rare
+        (one per checkpoint_size variations), and it's the same rebuild the
+        end of the job does anyway."""
+        for name in names:
+            self._last_run_status.pop(name, None)
+        self.reload()
 
     def _refresh_variation_row(self, variation):
         """Recomputes just `variation`'s own profile/fom/stale columns
