@@ -54,16 +54,25 @@ def _format_sig(value, digits=4):
 
 
 class VariationDetail(ttk.Frame):
-    def __init__(self, master, problems_panel=None):
+    def __init__(self, master, problems_panel=None, on_sort=None, current_sort=None):
         """`problems_panel`: an analog_designer.gui.problems_panel.ProblemsPanel
         instance already built (and placed) elsewhere -- app.py hosts it as
         "Errors"/"Warnings" tabs sharing the same box as its own Console
         (see app.py's _build_console()), not as a section living here, so
         this panel only ever calls .show()/.clear() on it, never builds or
         packs it. None (e.g. a standalone smoke test) just skips those
-        calls."""
+        calls.
+
+        `on_sort(criterion, descending)`: called from the right-click menus
+        on a metric or profile row to sort the Variations table by it (see
+        VariationsTable.set_criterion for the criterion shape; None clears
+        it). `current_sort()` returns the active criterion, so the menus
+        only offer "Clear" when there's something to clear. None disables
+        the menus."""
         super().__init__(master)
         self.problems_panel = problems_panel
+        self._on_sort = on_sort
+        self._current_sort = current_sort or (lambda: None)
         self._variation_name = None
         self._variation_block = None
         self._metrics = []
@@ -98,6 +107,7 @@ class VariationDetail(ttk.Frame):
         self.profiles_tree.tag_configure("error", foreground="#c0392b")
         self.profiles_tree.tag_configure("unmatched", foreground="#888888")
         self.profiles_tree.bind("<<TreeviewSelect>>", self._on_profile_select)
+        self.profiles_tree.bind("<Button-3>", self._on_profile_menu)
 
         metrics_frame = ttk.LabelFrame(body, text="Tests / metrics")
         metrics_frame.pack(fill="x", pady=(0, 8))
@@ -124,6 +134,7 @@ class VariationDetail(ttk.Frame):
         self.metrics_tree.tag_configure("stale", background="#fff3cd")
         self.metrics_tree.tag_configure("running", background="#cfe2ff")
         self.metrics_tree.bind("<<TreeviewSelect>>", self._on_metric_select)
+        self.metrics_tree.bind("<Button-3>", self._on_metric_menu)
 
         self.plot_notebook = ttk.Notebook(body)
         self.plot_notebook.pack(fill="both", expand=True)
@@ -246,6 +257,54 @@ class VariationDetail(ttk.Frame):
         self._render_plot(test_name)
         if self.problems_panel:
             self.problems_panel.show(self._variation_name, test_name)
+
+    def _popup(self, event, title, entries):
+        """Context menu at the mouse: a disabled `title` line, then
+        (label, criterion, descending) entries that sort the Variations
+        table, then "Clear variation sort" when a sort is active."""
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label=title, state="disabled")
+        menu.add_separator()
+        for label, criterion, descending in entries:
+            menu.add_command(label=label, command=lambda c=criterion, d=descending: self._on_sort(c, d))
+        if self._current_sort() is not None:
+            menu.add_separator()
+            menu.add_command(label="Clear variation sort", command=lambda: self._on_sort(None, False))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _on_metric_menu(self, event):
+        if self._on_sort is None:
+            return
+        item = self.metrics_tree.identify_row(event.y)
+        if not item:
+            return
+        self.metrics_tree.selection_set(item)
+        test, metric = self.metrics_tree.set(item, "test"), self.metrics_tree.set(item, "metric")
+        row = next((r for r in self._metrics if r["test"] == test and r["metric"] == metric), {})
+        fields = ["typical", "min", "max"] + [f for f in ("mean", "std") if row.get(f) is not None]
+        entries = []
+        for field in fields:
+            criterion = {"kind": "metric", "test": test, "metric": metric, "field": field}
+            entries.append((f"{field}, lowest first", criterion, False))
+            entries.append((f"{field}, highest first", criterion, True))
+        self._popup(event, f"Sort variations by {metric}", entries)
+
+    def _on_profile_menu(self, event):
+        if self._on_sort is None:
+            return
+        item = self.profiles_tree.identify_row(event.y)
+        if not item:
+            return
+        self.profiles_tree.selection_set(item)
+        entries = [
+            ("fom, highest first", {"kind": "profile", "profile": item, "field": "fom"}, True),
+            ("fom, lowest first", {"kind": "profile", "profile": item, "field": "fom"}, False),
+            ("constraints passed, most first", {"kind": "profile", "profile": item, "field": "passed"}, True),
+        ]
+        self._popup(event, f"Sort variations by profile {item}", entries)
 
     def _render_plot(self, test_name):
         for tab in self.plot_notebook.tabs():

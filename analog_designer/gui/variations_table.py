@@ -1,7 +1,7 @@
 """Top-level table: one row per circuit variation (not per test/metric --
-see variation_detail.py for that), with its design-profile classification
-(the only pass/fail-like signal -- tests themselves are purely
-informative, no absolute spec). Selecting a row drives variation_detail.py.
+see variation_detail.py for that). Selecting a row drives
+variation_detail.py; right-clicking a metric or profile there picks what
+this table is sorted by (see set_criterion()), shown in its "sort" column.
 
 selectmode="extended" gives native multi-select: plain click replaces the
 selection, Shift+click extends a contiguous range from the last-clicked row
@@ -20,7 +20,12 @@ from tkinter import ttk
 
 from analog_designer.results import fom as fom_module
 
-COLUMNS = ("variation", "status", "stale", "problems", "block", "topology", "profile", "fom", "metrics", "created")
+COLUMNS = ("variation", "sort", "status", "stale", "problems", "block", "topology", "metrics", "created")
+# "sort" shows each row's value for whatever criterion the user picked from
+# the detail panel's right-click menus (a metric's typical/min/max/mean/std,
+# or a profile's fom / constraints passed) -- see set_criterion(). It
+# replaces the fixed "profile"/"fom" columns, which only ever showed the
+# FIRST matched profile and read as ambiguous with several profiles around.
 # "problems" is a distinct-diagnostic-count readout (not raw occurrence
 # count) sourced from analog_designer.results.data.variation_problem_counts
 # -- e.g. "!1" for 5 identical ngspice warnings that all group into one
@@ -40,11 +45,46 @@ COLUMNS = ("variation", "status", "stale", "problems", "block", "topology", "pro
 # which reads as random flicker, not progress, and never answers "which one
 # is actually taking longer" or "has this one finished yet".
 # Columns whose displayed text doesn't sort correctly as a plain string --
-# "fom" since format_fom() renders "<1"/"449K"/"N/A" (K/M/B/T suffixes
-# don't compare lexically the way their magnitudes do), "metrics" because
-# it's an int shown without zero-padding ("10" sorts before "9" as text).
-# Sorted by the real underlying number instead, via _sort_values below.
-NUMERIC_COLUMNS = {"fom", "metrics"}
+# "sort" since its text is formatted ("<1"/"449K" foms, "%.4g" metrics,
+# "3/5" passed counts), "metrics" because it's an int shown without
+# zero-padding ("10" sorts before "9" as text). Sorted by the real
+# underlying number instead, via _sort_values below.
+NUMERIC_COLUMNS = {"sort", "metrics"}
+
+SORT_HEADING = "sort (right-click a metric/profile)"
+
+
+def criterion_label(criterion):
+    """Heading text for a set_criterion() criterion, without the arrow."""
+    if criterion["kind"] == "metric":
+        return f"{criterion['metric']} ({criterion['field']})"
+    return f"{criterion['profile']} ({'fom' if criterion['field'] == 'fom' else 'passed'})"
+
+
+def criterion_value(criterion, s):
+    """(sort_value, text) of summary `s` under `criterion`. sort_value None
+    (missing metric/statistic, fom error, complex fom) always sorts last."""
+    if criterion["kind"] == "metric":
+        stats = s.get("metric_stats", {}).get((criterion["test"], criterion["metric"]))
+        value = stats.get(criterion["field"]) if stats else None
+        if not isinstance(value, (int, float)):
+            return None, ""
+        return value, f"{value:.4g} {stats.get('unit') or ''}".strip()
+    profile = next((p for p in s.get("profiles", []) if p["profile"] == criterion["profile"]), None)
+    if profile is None:
+        return None, ""
+    if criterion["field"] == "passed":
+        # Ties (many variations at e.g. 6/7) broken by the profile's fom.
+        fom_value = profile["fom"] if isinstance(profile["fom"], (int, float)) else float("-inf")
+        return (profile["n_satisfied"], fom_value), f"{profile['n_satisfied']}/{profile['n_constraints']}"
+    if profile["fom_error"]:
+        return None, profile["fom_error"]
+    value = profile["fom"]
+    if not isinstance(value, (int, float)):
+        # A complex fom (pow() of a negative ratio by a fractional weight)
+        # renders "N/A" and can't be compared against a float for sorting.
+        return None, "" if value is None else fom_module.format_fom(value)
+    return value, fom_module.format_fom(value)
 
 
 def _problems_text(problems):
@@ -84,6 +124,8 @@ class VariationsTable(ttk.Frame):
             self.tree.heading(col, text=col, command=lambda c=col: self._sort_by(c))
             self.tree.column(col, width=110, anchor="w")
         self.tree.column("variation", width=180)
+        self.tree.heading("sort", text=SORT_HEADING)
+        self.tree.column("sort", width=190, anchor="e")
         self.tree.column("status", width=170, anchor="w")  # room for "⏳ <test> Ns", not just "Ns" -- a first guess, easy to retune
         self.tree.column("stale", width=40, anchor="center")
         self.tree.column("problems", width=60, anchor="center")
@@ -105,8 +147,7 @@ class VariationsTable(ttk.Frame):
         self.grid_rowconfigure(1, weight=1)
         self.grid_columnconfigure(0, weight=1)
 
-        self.tree.tag_configure("classified", foreground="#1a7f37")
-        self.tree.tag_configure("unclassified", foreground="#888888")
+        self.tree.tag_configure("matched", foreground="#1a7f37")  # meets every constraint of the profile being sorted by
         self.tree.tag_configure("stale", background="#fff3cd")
         self.tree.tag_configure("running", background="#cfe2ff")  # cleared once that row's own "status" text freezes at pass/fail -- see set_done()
         self.tree.tag_configure("slow", foreground="#b35900")  # layered on top of "running" past App._SLOW_ROW_THRESHOLD_S -- flags a genuinely slow row, not just a numeric readout
@@ -125,6 +166,8 @@ class VariationsTable(ttk.Frame):
 
         self._sort_state = {}
         self._sort_values = {}
+        self._summaries = {}  # iid -> summary, so set_criterion() can recompute "sort" without a reload
+        self._criterion = None  # see set_criterion()
 
     def _build_row(self, s):
         """(values, tags, sort_entry) for one variation summary -- the exact
@@ -132,31 +175,44 @@ class VariationsTable(ttk.Frame):
         append-only insert during a running job) hand to tree.insert(), so a
         row painted mid-batch can never look different from what a later
         full reload() would have produced for the same summary."""
-        primary = s["primary_profile"]
-        fom_value = None
-        if primary is None:
-            tag, profile_text, fom_text = "unclassified", "unclassified", ""
-        elif primary["fom_error"]:
-            tag, profile_text, fom_text = "classified", primary["profile"], primary["fom_error"]
-        else:
-            tag = "classified"
-            profile_text = primary["profile"]
-            fom_value = primary["fom"]
-            fom_text = "" if fom_value is None else fom_module.format_fom(fom_value)
+        sort_value, sort_text = criterion_value(self._criterion, s) if self._criterion else (None, "")
         values = (
-            s["variation"], "", "*" if s.get("has_stale") else "", _problems_text(s.get("problems")),
-            s["block"], s["topology"], profile_text, fom_text, s["n_total"], s["created"],
+            s["variation"], sort_text, "", "*" if s.get("has_stale") else "", _problems_text(s.get("problems")),
+            s["block"], s["topology"], s["n_total"], s["created"],
         )
-        tags = (tag, "stale") if s.get("has_stale") else (tag,)
-        # isinstance-guard against a complex fom (pow() of a negative ratio
-        # by a fractional weight -- format_fom() already renders that "N/A",
-        # but a complex number can't be compared against a float for
-        # sorting) -- treated the same as "no fom" below.
-        sort_entry = {
-            "fom": fom_value if isinstance(fom_value, (int, float)) else None,
-            "metrics": s["n_total"],
-        }
+        tags = ("stale",) if s.get("has_stale") else ()
+        if self._criterion and self._criterion["kind"] == "profile":
+            profile = next((p for p in s.get("profiles", []) if p["profile"] == self._criterion["profile"]), None)
+            if profile and profile["matched"]:
+                tags += ("matched",)
+        sort_entry = {"sort": sort_value, "metrics": s["n_total"]}
         return values, tags, sort_entry
+
+    def set_criterion(self, criterion, descending=False):
+        """Sort every row by `criterion` and show each row's value for it in
+        the "sort" column -- driven by the detail panel's right-click menus
+        (see VariationDetail). criterion is
+            {"kind": "metric", "test": ..., "metric": ..., "field": "typical"|"min"|"max"|"mean"|"std"}
+            {"kind": "profile", "profile": ..., "field": "fom"|"passed"}
+        or None to clear it. Kept across reload()s (set_rows re-applies it);
+        clicking the "sort" heading flips the direction."""
+        self._criterion = criterion
+        for iid, s in self._summaries.items():
+            values, tags, sort_entry = self._build_row(s)
+            live_tags = set(self.tree.item(iid, "tags")) & {"running", "slow"}
+            status = self.tree.set(iid, "status")
+            self.tree.item(iid, values=values, tags=tuple(set(tags) | live_tags))
+            self.tree.set(iid, "status", status)
+            self._sort_values[iid] = sort_entry
+        if criterion is None:
+            self.tree.heading("sort", text=SORT_HEADING)
+            return
+        self._sort_state["sort"] = descending
+        self._sort_by("sort")
+
+    @property
+    def criterion(self):
+        return self._criterion
 
     def _update_count_label(self):
         total = len(self.tree.get_children(""))
@@ -169,10 +225,16 @@ class VariationsTable(ttk.Frame):
     def set_rows(self, summaries):
         self.tree.delete(*self.tree.get_children())
         self._sort_values = {}
+        self._summaries = {}
         for s in summaries:
             values, tags, sort_entry = self._build_row(s)
             iid = self.tree.insert("", "end", values=values, tags=tags)
             self._sort_values[iid] = sort_entry
+            self._summaries[iid] = s
+        if self._criterion is not None:
+            # Keep the user's chosen order (and direction) across reloads.
+            self._sort_state["sort"] = not self._sort_state.get("sort", True)
+            self._sort_by("sort")
         self._update_count_label()
 
     def add_new_rows(self, summaries):
@@ -196,15 +258,17 @@ class VariationsTable(ttk.Frame):
             values, tags, sort_entry = self._build_row(s)
             iid = self.tree.insert("", "end", values=values, tags=tags)
             self._sort_values[iid] = sort_entry
+            self._summaries[iid] = s
         self._update_count_label()
 
     def _sort_by(self, col):
         reverse = self._sort_state.get(col, False)
         if col in NUMERIC_COLUMNS:
-            def key(k):
-                value = self._sort_values.get(k, {}).get(col)
-                return (value is not None, value) if value is not None else (False, 0)
-            items = sorted(self.tree.get_children(""), key=key, reverse=reverse)
+            # Rows without a value always go last, whichever the direction.
+            children = self.tree.get_children("")
+            known = [k for k in children if self._sort_values.get(k, {}).get(col) is not None]
+            missing = [k for k in children if self._sort_values.get(k, {}).get(col) is None]
+            items = sorted(known, key=lambda k: self._sort_values[k][col], reverse=reverse) + missing
         else:
             items = [k for _, k in sorted(
                 ((self.tree.set(k, col), k) for k in self.tree.get_children("")),
@@ -213,6 +277,8 @@ class VariationsTable(ttk.Frame):
         for pos, k in enumerate(items):
             self.tree.move(k, "", pos)
         self._sort_state[col] = not reverse
+        if col == "sort" and self._criterion is not None:
+            self.tree.heading("sort", text=f"{criterion_label(self._criterion)} {'↓' if reverse else '↑'}")
 
     def _on_select(self, _event):
         """Fires on every selection change, including a Shift-click range --
@@ -265,8 +331,8 @@ class VariationsTable(ttk.Frame):
         return None
 
     def update_row(self, s):
-        """Refreshes one existing row's profile/fom/stale/metrics columns
-        (and their "classified"/"unclassified"/"stale" tags) from a freshly
+        """Refreshes one existing row's sort/stale/metrics columns
+        (and their "matched"/"stale" tags) from a freshly
         computed summary -- "status" and any "running"/"slow" tag are left
         untouched, those stay set_running()/set_done()'s own job. Called
         right after a batch job's own per-variation "@PROGRESS DONE ..."
@@ -284,6 +350,7 @@ class VariationsTable(ttk.Frame):
         self.tree.item(item, values=values, tags=tuple(set(tags) | live_tags))
         self.tree.set(item, "status", current_status)
         self._sort_values[item] = sort_entry
+        self._summaries[item] = s
 
     def set_running(self, name, text, slow=False):
         """Live "status" text for `name`'s own row (e.g. "running: 12s") plus

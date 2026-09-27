@@ -343,7 +343,10 @@ class App(ttk.Frame):
         left.add(self.table, weight=2)
         left.add(self.params_panel, weight=1)
 
-        self.detail = VariationDetail(paned, problems_panel=self.problems_panel)
+        self.detail = VariationDetail(
+            paned, problems_panel=self.problems_panel,
+            on_sort=self.table.set_criterion, current_sort=lambda: self.table.criterion,
+        )
         paned.add(left, weight=1)
         paned.add(self.detail, weight=2)
 

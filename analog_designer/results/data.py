@@ -244,6 +244,13 @@ def variation_summaries(all_topologies=False, names=None):
             "profiles": profiles,
             "primary_profile": primary_profile,
             "metrics_by_description": {r["metric"]: r["typical"] for r in rows},
+            # (test, metric) -> every stored statistic of that metric -- what
+            # the Variations table sorts by when the user picks a metric +
+            # statistic from the detail panel (see VariationsTable.set_criterion).
+            "metric_stats": {
+                (r["test"], r["metric"]): {k: r.get(k) for k in ("typical", "min", "max", "mean", "std", "unit")}
+                for r in rows
+            },
             "has_stale": any(r.get("stale") for r in rows),
             "problems": variation_problem_counts(variation["name"]),
             "created": variation["created"],
