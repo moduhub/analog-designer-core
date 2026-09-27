@@ -966,7 +966,29 @@ def _rewrite_jsonl(path, keep):
     with tmp_path.open("w", encoding="utf-8") as f:
         for row in rows:
             f.write(json.dumps(row) + "\n")
-    os.replace(tmp_path, path)
+    _replace_with_retry(tmp_path, path)
+
+
+def _replace_with_retry(src, dst, timeout_s=10.0):
+    """os.replace(), retried on PermissionError for up to timeout_s. On
+    Windows the swap fails ("Access is denied") whenever ANY other process
+    has `dst` open at that instant -- the GUI's own 1s new-row poll and
+    per-variation DONE refresh read results.jsonl/variations.jsonl
+    throughout a batch, and editors/indexers/antivirus take brief handles
+    too. Those reads are short, so a few retries get through; a
+    discard-on-fail checkpoint used to crash the whole batch on the first
+    collision instead."""
+    deadline = time.monotonic() + timeout_s
+    delay = 0.05
+    while True:
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 0.5)
 
 
 def ensure_variation_registered(name, block, topology, params, origin=None):
@@ -1675,6 +1697,39 @@ _NETLIST_MAX_ATTEMPTS = 3
 _NETLIST_RETRY_DELAY_SECONDS = 0.5
 
 
+def _missing_project_subckts(netlist_text):
+    """Names of this project's own blocks (config.json "blocks") that the
+    netlist instantiates (an X line whose model is that block) but never
+    defines with a .subckt -- xschem intermittently emits a netlist with a
+    hierarchical block's expansion silently absent (see run_one_ngspice()'s
+    own docstring). ngspice at least fails loudly on that ("unknown
+    subckt"), but a static "netlist" test (area) would read ZERO devices
+    and record 0.0 as a valid result -- confirmed live, 14 of 236
+    ihp_mh_ip__cmos_vref area results (2026-09-27). PDK devices
+    (sg13_hv_nmos, ...) are subckts too, but come from the .lib files, not
+    the netlist, so only project block names are checked."""
+    blocks = {name.lower() for name in workspace.CONFIG.get("blocks", {})}
+    lines = []
+    for raw in netlist_text.splitlines():
+        if raw.startswith("+") and lines:
+            lines[-1] += " " + raw[1:]
+        else:
+            lines.append(raw)
+    defined, used = set(), set()
+    for line in lines:
+        tokens = line.split()
+        if not tokens:
+            continue
+        head = tokens[0].lower()
+        if head == ".subckt" and len(tokens) > 1:
+            defined.add(tokens[1].lower())
+        elif head.startswith("x"):
+            model = next((tok for tok in reversed(tokens[1:]) if "=" not in tok), None)
+            if model is not None and model.lower() in blocks:
+                used.add(model.lower())
+    return used - defined
+
+
 def _netlist(container, test_name, tb_source, conditions, tb_params_base,
              run_dir, container_run_dir, container_rcfile, ctx):
     """Materialize + netlist one testbench through xschem -- the half of
@@ -1742,17 +1797,22 @@ def _netlist(container, test_name, tb_source, conditions, tb_params_base,
     for attempt in range(1, _NETLIST_MAX_ATTEMPTS + 1):
         result = docker_exec(container, netlist_cmd)
         if netlist_path.exists():
-            break
+            missing = _missing_project_subckts(netlist_path.read_text(encoding="utf-8"))
+            if not missing:
+                break
+            failure = (
+                f"netlist is missing the .subckt expansion of {', '.join(sorted(missing))} "
+                f"after {attempt} attempt(s) (see _missing_project_subckts())."
+            )
+            netlist_path.unlink()
+        else:
+            failure = (
+                f"netlist failed, no .spice produced after {attempt} attempt(s) "
+                f"(see _netlist()'s own comment on this being a known transient "
+                f"xschem/concurrency flake, not a content problem)."
+            )
         if attempt == _NETLIST_MAX_ATTEMPTS:
-            return {
-                "status": "error",
-                "error": (
-                    f"netlist failed, no .spice produced after {attempt} attempt(s) "
-                    f"(see _netlist()'s own comment on this being a known transient "
-                    f"xschem/concurrency flake, not a content problem).\n"
-                    f"{result.stdout}\n{result.stderr}"
-                ),
-            }
+            return {"status": "error", "error": f"{failure}\n{result.stdout}\n{result.stderr}"}
         time.sleep(_NETLIST_RETRY_DELAY_SECONDS)
     netlist_text = netlist_path.read_text(encoding="utf-8")
     if "IS MISSING" in netlist_text:

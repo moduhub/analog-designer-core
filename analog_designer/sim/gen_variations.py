@@ -121,6 +121,25 @@ def random_params(param_defs, rng, spread_pct=None):
 DEFAULT_CHECKPOINT_MULTIPLIER = 3
 
 
+def _trim_all(names):
+    """trim_variation() each of `names` -> (trimmed, failed). A trim that
+    still fails after run_sim._replace_with_retry()'s own retries (a file
+    held open by another process) is reported and handed back for the next
+    checkpoint to retry, instead of raising out of the batch and killing
+    every variation still queued behind it. trim_variation() is
+    idempotent, so a half-done trim (variations.jsonl rewritten,
+    results.jsonl not) simply finishes on the retry."""
+    trimmed, failed = [], []
+    for name in names:
+        try:
+            trim_variation(name)
+            trimmed.append(name)
+        except OSError as exc:
+            print(f"checkpoint: could not discard {name} yet ({exc}) -- will retry at the next checkpoint")
+            failed.append(name)
+    return trimmed, failed
+
+
 def _run_batch(param_sets, block_cfg, tests, defaults, force, origin, skip_on_fail_profile=None,
                 skip_on_fail_max_failures=0, discard_on_fail=False, checkpoint_size=None):
     """Simulate each of param_sets through run_variation, reusing one
@@ -265,14 +284,16 @@ def _run_batch(param_sets, block_cfg, tests, defaults, force, origin, skip_on_fa
         nonlocal to_discard, discarded_total
         if not to_discard:
             return
-        for name in to_discard:
-            trim_variation(name)
+        to_discard, failed = _trim_all(to_discard)
+        if not to_discard:
+            to_discard = failed
+            return
         discarded_total += len(to_discard)
         print(f"checkpoint: discarded {len(to_discard)} variation(s) that disqualified "
               f"{skip_on_fail_profile!r} beyond {skip_on_fail_max_failures} allowed failure(s) "
               f"({discarded_total} total so far): {', '.join(to_discard)}")
         emit_progress_trimmed(to_discard)
-        to_discard = []
+        to_discard = failed
 
     with managed_container() as container:
         container_ctx = setup_container(container)
@@ -511,14 +532,16 @@ def _run_hierarchical_batch(jobs, defaults, force, skip_on_fail_profile=None,
         nonlocal to_discard, discarded_total
         if not to_discard:
             return
-        for name in to_discard:
-            trim_variation(name)
+        to_discard, failed = _trim_all(to_discard)
+        if not to_discard:
+            to_discard = failed
+            return
         discarded_total += len(to_discard)
         print(f"checkpoint: discarded {len(to_discard)} variation(s) (composed job(s) that disqualified "
               f"{skip_on_fail_profile!r} plus their own freshly-generated sub-blocks, {discarded_total} "
               f"total so far): {', '.join(to_discard)}")
         emit_progress_trimmed(to_discard)
-        to_discard = []
+        to_discard = failed
 
     # Both branches below chunk the SAME way: groups of `checkpoint_size`
     # consecutive samples (_iterations(jobs) -- each group is one composed
