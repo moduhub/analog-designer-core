@@ -152,27 +152,39 @@ def constraint_satisfied(slug, bounds, variables):
     return True
 
 
-def constraints_violated(constraints, variables):
-    """True the moment any of `constraints` (one profile's own {slug:
-    bounds} dict) is ALREADY known to be violated, given only the metrics
-    on hand so far -- the early-exit counterpart to classify()'s own
-    constraint_satisfied(), with the OPPOSITE missing-metric polarity.
-    constraint_satisfied()'s "no data -- counts against it" is correct only
-    for classify()'s post-hoc, every-test-already-ran scoring; here, a
-    constraint whose metric simply hasn't been simulated YET this run (a
-    test still later in a still-in-progress variation) must NOT count as a
-    violation -- treating it as one would trigger analog_designer.sim.run_sim's
-    own --skip-on-fail after the very first test, every time, regardless of
-    which profile was actually targeted. A constraint is judged only once
-    its own metric is present in `variables` -- at which point it's judged
-    exactly like classify() would. Stops at the first known violation
-    (run_variation() only needs a yes/no to decide whether to keep
-    simulating, not a full tally of everything already broken)."""
+def constraints_violated(constraints, variables, max_failures=0):
+    """True the moment MORE THAN `max_failures` of `constraints` (one
+    profile's own {slug: bounds} dict) are ALREADY known to be violated,
+    given only the metrics on hand so far -- the early-exit counterpart to
+    classify()'s own constraint_satisfied(), with the OPPOSITE missing-
+    metric polarity. constraint_satisfied()'s "no data -- counts against
+    it" is correct only for classify()'s post-hoc, every-test-already-ran
+    scoring; here, a constraint whose metric simply hasn't been simulated
+    YET this run (a test still later in a still-in-progress variation)
+    must NOT count as a violation -- treating it as one would trigger
+    analog_designer.sim.run_sim's own --skip-on-fail after the very first
+    test, every time, regardless of which profile was actually targeted. A
+    constraint is judged only once its own metric is present in
+    `variables` -- at which point it's judged exactly like classify()
+    would.
+
+    max_failures=0 (the original, default behavior) still stops at the
+    FIRST known violation -- run_variation() only needs a yes/no to decide
+    whether to keep simulating. A positive max_failures tolerates that many
+    already-violated constraints before returning True, for a Monte Carlo
+    search that wants to keep a design candidate whose profile isn't a
+    perfect, unanimous pass across every one of its constraints (e.g. one
+    corner slightly out of spec on an otherwise-good design) -- still O(1)
+    extra work over the max_failures=0 case: this only ever counts up to
+    max_failures+1 violations before returning, never tallies the rest."""
+    violated = 0
     for slug, bounds in constraints.items():
         if f"{slug}_observed_min" not in variables:
             continue
         if not constraint_satisfied(slug, bounds, variables):
-            return True
+            violated += 1
+            if violated > max_failures:
+                return True
     return False
 
 

@@ -1,5 +1,5 @@
 """Checks a transistor's Vgs/Vds/Vgb/Vdb/Vsb -- read directly from the
-actual simulated node-voltage waveforms (analog_designer.sim.raw_reader),
+actual simulated node-voltage waveforms (analog_designer.sim.raw_peaks),
 using each device's real gate/drain/source/bulk net (analog_designer.sim.
 spice_devices) -- against explicit, sourced technology limits, replacing
 the earlier approach of trusting the PSP103 model's own internal SOA check
@@ -46,21 +46,36 @@ docs instead of the model's stale defaults:
 # every other internal net (which gets an "x1."-style prefix instead).
 _GROUND_NAMES = {"gnd", "0"}
 
-_SOA_PARAMS = ("vgs", "vds", "vgb", "vdb", "vsb")
+# param -> (plus pin, minus pin)
+_SOA_PARAMS = {"vgs": ("g", "s"), "vds": ("d", "s"), "vgb": ("g", "b"), "vdb": ("d", "b"), "vsb": ("s", "b")}
 
 
-def _node_voltages(net, raw_data, var_index):
-    if net.lower() in _GROUND_NAMES:
-        return [0.0] * len(raw_data["rows"])
-    idx = var_index.get(f"v({net.lower()})")
-    if idx is None:
-        return None
-    return [row[idx] for row in raw_data["rows"]]
+def _raw_name(net):
+    """The .raw variable holding `net`'s voltage, or None for ground (see
+    raw_peaks.signed_peaks())."""
+    return None if net.lower() in _GROUND_NAMES else f"v({net.lower()})"
 
 
-def check_soa(devices, raw_data, limits):
+def _device_pairs(dev):
+    return {param: (_raw_name(dev[plus]), _raw_name(dev[minus])) for param, (plus, minus) in _SOA_PARAMS.items()}
+
+
+def soa_pairs(devices, limits):
+    """Every (a, b) node-voltage pair check_soa() will need a peak for --
+    what to ask raw_peaks.signed_peaks() for. Devices whose family has no
+    limits are left out, same as check_soa() skips them."""
+    pairs = set()
+    for dev in devices:
+        if limits.get(dev["family"]):
+            pairs.update(_device_pairs(dev).values())
+    return sorted(pairs, key=lambda pair: (pair[0] or "", pair[1] or ""))
+
+
+def check_soa(devices, peaks, limits):
     """devices: resolved list from spice_devices (real net names, not local
-    ones). raw_data: {"variables", "rows"} from raw_reader.read_ascii_raw().
+    ones). peaks: {(a, b): signed peak of v(a) - v(b)} from
+    raw_peaks.signed_peaks() over soa_pairs(devices, limits) -- a device with
+    any pair missing (a net not saved in the .raw) is skipped entirely.
     limits: {"lv": {"vgs_max":..., ...}, "hv": {...}} (config.json's own
     technology.mosfet_limits, passed in as-is -- this module has no
     fallback/default of its own, a missing family or param simply isn't
@@ -68,35 +83,16 @@ def check_soa(devices, raw_data, limits):
     count, key} shape analog_designer.sim.log_diagnostics.parse() already
     produces, so the existing runs.jsonl/GUI Problems-panel pipeline needs
     no changes to consume this."""
-    var_index = {name.lower(): i for i, name in enumerate(raw_data["variables"])}
     diagnostics = []
 
     for dev in devices:
         family_limits = limits.get(dev["family"])
         if not family_limits:
             continue
-
-        pin_voltages = {}
-        skip = False
-        for pin in ("d", "g", "s", "b"):
-            voltages = _node_voltages(dev[pin], raw_data, var_index)
-            if voltages is None:
-                skip = True
-                break
-            pin_voltages[pin] = voltages
-        if skip:
+        pairs = _device_pairs(dev)
+        if any(pair not in peaks for pair in pairs.values()):
             continue
-
-        peak = {p: 0.0 for p in _SOA_PARAMS}
-        for i in range(len(raw_data["rows"])):
-            vd, vg, vs, vb = (pin_voltages[p][i] for p in ("d", "g", "s", "b"))
-            candidates = {
-                "vgs": vg - vs, "vds": vd - vs,
-                "vgb": vg - vb, "vdb": vd - vb, "vsb": vs - vb,
-            }
-            for param, value in candidates.items():
-                if abs(value) > abs(peak[param]):
-                    peak[param] = value
+        peak = {param: peaks[pair] for param, pair in pairs.items()}
 
         for param, value in peak.items():
             limit = family_limits.get(f"{param}_max")

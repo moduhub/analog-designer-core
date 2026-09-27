@@ -37,7 +37,7 @@ import sys
 from analog_designer.core import workspace
 from analog_designer.results import data
 from analog_designer.sim.gen_variations import _clip, _render, _run_batch, parse_spice_value
-from analog_designer.sim.run_sim import BLOCK_REF_DEFAULT, validate_skip_on_fail_profile
+from analog_designer.sim.run_sim import BLOCK_REF_DEFAULT, validate_skip_on_fail_profile, validate_skip_on_fail_tolerance
 
 
 def cmd_basic(args, config):
@@ -84,7 +84,10 @@ def cmd_basic(args, config):
             continue
         params[name] = _render(_clip(parse_spice_value(overrides.get(name, pdef["default"])), pdef), pdef)
     origin = {"kind": "manual", "base": args.base} if args.base else {"kind": "manual"}
-    any_error = _run_batch([params], block_cfg, tests, defaults, args.force, origin=origin, skip_on_fail_profile=args.skip_on_fail)
+    any_error = _run_batch(
+        [params], block_cfg, tests, defaults, args.force, origin=origin, skip_on_fail_profile=args.skip_on_fail,
+        skip_on_fail_max_failures=args.skip_on_fail_max_failures, discard_on_fail=args.discard_on_fail,
+    )
     sys.exit(1 if any_error else 0)
 
 
@@ -111,6 +114,16 @@ def main():
         help="stop simulating a variation's remaining tests the moment they'd already disqualify PROFILE "
              "(a config.json blocks.<block>.profiles name) -- opt-in, off by default",
     )
+    parser.add_argument(
+        "--skip-on-fail-max-failures", type=int, default=0, metavar="N",
+        help="tolerate up to N already-violated constraints of --skip-on-fail's own PROFILE before actually "
+             "stopping (default 0: any single violation stops it) -- requires --skip-on-fail",
+    )
+    parser.add_argument(
+        "--discard-on-fail", action="store_true",
+        help="when --skip-on-fail (beyond --skip-on-fail-max-failures) actually stops this variation, trim it "
+             "entirely instead of leaving it registered with partial results -- requires --skip-on-fail",
+    )
     parser.add_argument("--seed", type=int, default=None, help="random seed for --param-spec draws, for reproducibility")
     parser.add_argument("--project-root", default=None, help="project folder to operate on; defaults to the last-opened folder, else CWD")
     parser.add_argument("--block", default=None, help="block to operate on; defaults to the first declared in config.json")
@@ -119,6 +132,7 @@ def main():
 
     workspace.open_folder(args.project_root, block=args.block, topology=args.topology)
     validate_skip_on_fail_profile(args.skip_on_fail)
+    validate_skip_on_fail_tolerance(args.skip_on_fail, args.skip_on_fail_max_failures, args.discard_on_fail)
     cmd_basic(args, workspace.CONFIG)
 
 

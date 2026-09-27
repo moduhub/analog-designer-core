@@ -22,7 +22,9 @@ import tkinter as tk
 from tkinter import ttk
 import random
 
-from analog_designer.gui.run_options_dialog import add_force_skip_fields, resolve_skip_profile
+from analog_designer.gui.run_options_dialog import (
+    add_force_skip_fields, add_skip_fail_tolerance_fields, resolve_skip_fail_tolerance, resolve_skip_profile,
+)
 from analog_designer.results import data
 from analog_designer.sim.run_sim import BLOCK_REF_DEFAULT
 
@@ -177,11 +179,12 @@ def _build_monte_carlo_tab(tab):
 
 def ask_create_variation(
     parent, config, block, topology, variations, param_defs, force, skip_on_fail_profile,
-    initial_tab="basic", default_parent=None,
+    initial_tab="basic", default_parent=None, skip_on_fail_max_failures=0, discard_on_fail=False,
 ):
     """dict tagged by "mode" ("basic"|"from_parent"|"monte_carlo") with that
-    mode's fields plus "force"/"skip_on_fail_profile", or None if
-    cancelled. config is the full config.json dict -- used both to look up
+    mode's fields plus "force"/"skip_on_fail_profile"/
+    "skip_on_fail_max_failures"/"discard_on_fail", or None if cancelled.
+    config is the full config.json dict -- used both to look up
     a "block_ref" parameter's own declared profiles for its "Sortear"
     picker, and (via add_force_skip_fields) the block's skip-on-fail
     profiles. block/topology are accepted for interface parity with pro's
@@ -222,6 +225,9 @@ def ask_create_variation(
     options_frame = ttk.Frame(body)
     options_frame.pack(fill="x", pady=(12, 0))
     force_var, profile_var = add_force_skip_fields(options_frame, config, force, skip_on_fail_profile)
+    max_failures_var, discard_var = add_skip_fail_tolerance_fields(
+        options_frame, skip_on_fail_max_failures, discard_on_fail,
+    )
 
     notebook.select(_TABS.index(initial_tab))
 
@@ -239,6 +245,9 @@ def ask_create_variation(
             value = {"mode": "monte_carlo", "count": mc_vars["count"].get(), "spread": spread}
         value["force"] = force_var.get()
         value["skip_on_fail_profile"] = resolve_skip_profile(profile_var)
+        value["skip_on_fail_max_failures"], value["discard_on_fail"] = resolve_skip_fail_tolerance(
+            profile_var, max_failures_var, discard_var,
+        )
         result["value"] = value
         win.destroy()
 

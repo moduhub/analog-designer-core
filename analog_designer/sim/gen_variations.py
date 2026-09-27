@@ -27,7 +27,8 @@ from analog_designer.sim.run_sim import (
     BLOCK_REF_DEFAULT, _read_jsonl, emit_progress_total, emit_progress_total_seconds,
     emit_progress_variation_done, ensure_variation_registered, historical_test_durations,
     load_results, managed_container, plan_seconds, plan_steps, run_variation,
-    setup_container, validate_skip_on_fail_profile, variation_name,
+    setup_container, trim_variation, validate_skip_on_fail_profile, validate_skip_on_fail_tolerance,
+    variation_name,
 )
 from analog_designer.sim.spice_value import _match, format_spice_value, parse_spice_value
 
@@ -112,7 +113,16 @@ def random_params(param_defs, rng, spread_pct=None):
     return params
 
 
-def _run_batch(param_sets, block_cfg, tests, defaults, force, origin, skip_on_fail_profile=None):
+#: checkpoint_size's own "auto" default (see _run_batch/_run_hierarchical_batch)
+#: is this multiplied by workspace.cpu_budget() -- e.g. 5 * 10 cores = checkpoint
+#: every 50 items. Chosen (not just 1x) so a checkpoint's own drain-the-chunk
+#: barrier doesn't starve faster cores waiting on one chunk's slowest straggler
+#: too often -- purely a starting point, override with --checkpoint-size.
+DEFAULT_CHECKPOINT_MULTIPLIER = 5
+
+
+def _run_batch(param_sets, block_cfg, tests, defaults, force, origin, skip_on_fail_profile=None,
+                skip_on_fail_max_failures=0, discard_on_fail=False, checkpoint_size=None):
     """Simulate each of param_sets through run_variation, reusing one
     on-demand container across the whole batch. Sequential when
     workspace.cpu_budget() is 1 (the only case for a single-item batch like
@@ -125,9 +135,56 @@ def _run_batch(param_sets, block_cfg, tests, defaults, force, origin, skip_on_fa
     one spends once running is governed separately, by
     workspace.core_pool() (see run_sim.py's THREAD_POLICY), not by this
     max_workers. Shared by every variation-generating command that
-    produces more than one param set at a time. skip_on_fail_profile is
-    forwarded to run_variation() unchanged -- a profile name or None/off,
+    produces more than one param set at a time. skip_on_fail_profile/
+    skip_on_fail_max_failures are forwarded to run_variation() unchanged --
     see its own docstring.
+
+    discard_on_fail is ALSO forwarded to every run_variation() call, but
+    the actual trim_variation() a discarded variation needs happens HERE,
+    never inside run_variation() itself (see its own discard_on_fail
+    docstring for exactly why: trim_variation()'s whole-file rewrite would
+    race a SIBLING variation's concurrent append on the very same two
+    files, in whichever of them wins that race losing whatever the other
+    one just wrote) -- the real invariant trim_variation() needs is just
+    "no other thread is CURRENTLY appending", which holds at every chunk
+    boundary below, not only once at the very end of the whole batch.
+
+    checkpoint_size splits param_sets into chunks of that many items,
+    each dispatched to its own short-lived ThreadPoolExecutor (parallel
+    mode) or, in sequential mode, just a checkpoint boundary every that
+    many items of the one long-running loop -- either way, this batch's
+    OWN discovered-since-the-last-checkpoint discards are trim_variation()'d
+    right after each chunk's own executor has fully drained (or, in
+    sequential mode, immediately -- there's only ever the one thread
+    there), instead of letting a whole afternoon-long low-hit-rate Monte
+    Carlo search's worth of garbage variations sit on disk until the
+    entire batch finishes. This costs some parallelism -- a chunk's
+    fastest worker still has to wait for that SAME chunk's slowest
+    straggler before the next chunk's work can even start dispatching --
+    a real, accepted tradeoff (disk usage over raw core utilization) for a
+    search whose useful-candidate hit rate is low enough that most
+    generated variations are getting discarded anyway.
+
+    None (the default) means "no periodic checkpointing at all" UNLESS
+    discard_on_fail is also True, in which case it defaults to
+    DEFAULT_CHECKPOINT_MULTIPLIER * workspace.cpu_budget() -- discard_on_fail
+    is the whole reason this exists, so turning it on already protects disk
+    usage with no extra flag required; pass an explicit checkpoint_size to
+    override that auto value (still only takes effect alongside
+    discard_on_fail -- nothing to periodically trim otherwise, so this is
+    silently a no-op, exactly like a plain skip_on_fail_profile with no
+    discard was already before this feature existed). A single time-based
+    ("every N minutes") alternative was considered instead but dropped: it
+    needs its own timer thread coordinating a mid-chunk drain, whereas a
+    sample count needs nothing extra -- ThreadPoolExecutor's own `with`
+    block already blocks until every submitted item in a chunk is done, a
+    checkpoint barrier "for free". The tradeoff: a batch whose remaining
+    items in the CURRENT chunk are individually very slow (few of them,
+    each expensive) won't checkpoint any sooner than that chunk's own
+    completion, regardless of how much wall-clock time has passed --
+    a non-issue for the many-cheap-samples Monte Carlo search this was
+    built for, but worth knowing if a future caller's own workload looks
+    different (few, expensive items).
 
     origin is normally one dict, broadcast to every item in the batch (every
     existing caller: manual_variation.py, update_variations.py, this
@@ -138,6 +195,10 @@ def _run_batch(param_sets, block_cfg, tests, defaults, force, origin, skip_on_fa
     its own (parent_a, parent_b) pair."""
     max_workers = workspace.cpu_budget()
     shadow = max_workers > 1
+    if discard_on_fail and checkpoint_size is None:
+        checkpoint_size = max(1, DEFAULT_CHECKPOINT_MULTIPLIER * max_workers)
+    elif not discard_on_fail:
+        checkpoint_size = None
     existing_names = {r["name"] for r in _read_jsonl(workspace.PROJECT_ROOT / "sim" / "variations.jsonl")}
     any_error = False
 
@@ -179,6 +240,7 @@ def _run_batch(param_sets, block_cfg, tests, defaults, force, origin, skip_on_fa
                 block_cfg, tests, defaults, params, force=force,
                 container_ctx=container_ctx, origin=item_origin, shadow=shadow, log_prefix=log_prefix,
                 skip_on_fail_profile=skip_on_fail_profile,
+                skip_on_fail_max_failures=skip_on_fail_max_failures, discard_on_fail=discard_on_fail,
             )
         except Exception as exc:
             # One variation's unexpected failure (not a StaleParameterSchema
@@ -203,7 +265,22 @@ def _run_batch(param_sets, block_cfg, tests, defaults, force, origin, skip_on_fa
             print(f"{log_prefix}{name}: ERROR (unexpected exception: {exc})")
             print(f"{log_prefix}{traceback.format_exc()}")
             emit_progress_variation_done(name, time.monotonic() - start_ts, True)
-            return {"variation": name, "any_error": True}
+            return {"variation": name, "any_error": True, "discard": False}
+
+    to_discard = []
+    discarded_total = 0
+
+    def _checkpoint():
+        nonlocal to_discard, discarded_total
+        if not to_discard:
+            return
+        for name in to_discard:
+            trim_variation(name)
+        discarded_total += len(to_discard)
+        print(f"checkpoint: discarded {len(to_discard)} variation(s) that disqualified "
+              f"{skip_on_fail_profile!r} beyond {skip_on_fail_max_failures} allowed failure(s) "
+              f"({discarded_total} total so far): {', '.join(to_discard)}")
+        to_discard = []
 
     with managed_container() as container:
         container_ctx = setup_container(container)
@@ -212,11 +289,41 @@ def _run_batch(param_sets, block_cfg, tests, defaults, force, origin, skip_on_fa
                 outcome = _run_one(i, params)
                 existing_names.add(outcome["variation"])
                 any_error = any_error or outcome["any_error"]
+                if outcome.get("discard"):
+                    to_discard.append(outcome["variation"])
+                if checkpoint_size and (i + 1) % checkpoint_size == 0:
+                    _checkpoint()
         else:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-                futures = [pool.submit(_run_one, i, params) for i, params in enumerate(param_sets)]
-                for future in concurrent.futures.as_completed(futures):
-                    any_error = any_error or future.result()["any_error"]
+            # No checkpointing at all (checkpoint_size is None): one single
+            # dispatch across the whole batch, unchanged from before this
+            # feature existed. Checkpointing: one short-lived
+            # ThreadPoolExecutor per chunk instead -- its own `with` block
+            # already blocks until every item IN THAT CHUNK is done, which
+            # is exactly the drain barrier a checkpoint needs, for free.
+            chunks = (
+                [param_sets[start:start + checkpoint_size] for start in range(0, len(param_sets), checkpoint_size)]
+                if checkpoint_size else [param_sets]
+            )
+            offset = 0
+            for chunk in chunks:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+                    futures = [pool.submit(_run_one, offset + j, params) for j, params in enumerate(chunk)]
+                    for future in concurrent.futures.as_completed(futures):
+                        outcome = future.result()
+                        any_error = any_error or outcome["any_error"]
+                        if outcome.get("discard"):
+                            to_discard.append(outcome["variation"])
+                offset += len(chunk)
+                # Safe here: this chunk's own executor has fully drained
+                # (its `with` block just exited), so no thread from it could
+                # still be appending to variations.jsonl/results.jsonl --
+                # the next chunk hasn't started dispatching yet either.
+                _checkpoint()
+
+    # Final flush for whatever's left since the last checkpoint boundary (or
+    # everything, if checkpoint_size was never set) -- same safety as every
+    # earlier _checkpoint() call, now that the whole batch/container is done.
+    _checkpoint()
 
     return any_error
 
@@ -258,7 +365,36 @@ def generate_hierarchical_param_set(config, block_cfg, block, topology, rng, spr
     return top_params, sub_jobs
 
 
-def _run_hierarchical_batch(jobs, defaults, force, skip_on_fail_profile=None):
+def _iterations(jobs):
+    """Group a flat hierarchical `jobs` list (see main()'s own hierarchical
+    branch) back into per-SAMPLE groups -- each group is one top-level
+    composed attempt's own freshly-generated sub-block jobs, followed by
+    its own top-level job (the exact shape main() builds: jobs.extend(sub_jobs)
+    then jobs.append(top_job)). A top-level job is any job carrying
+    "discard_with" (see generate_hierarchical_param_set()); every job
+    since the previous one (or the start) belongs to that same sample.
+    Needed so _run_hierarchical_batch()'s own checkpoint_size groups by
+    SAMPLE (one whole composed attempt -- what "a cada N amostras" means
+    to whoever launched the search), not by raw job count, which would
+    otherwise risk splitting one sample's own sub-jobs from its own
+    top-level job across two different checkpoint chunks for no reason."""
+    group = []
+    for job in jobs:
+        group.append(job)
+        if "discard_with" in job:
+            yield group
+            group = []
+    if group:
+        # No top-level job ever closed this final group (shouldn't happen
+        # given how main() builds `jobs` today, but don't silently drop
+        # jobs if some future caller's own shape ever differs) -- surface
+        # whatever's left as its own last, incomplete group rather than
+        # dropping it.
+        yield group
+
+
+def _run_hierarchical_batch(jobs, defaults, force, skip_on_fail_profile=None,
+                             skip_on_fail_max_failures=0, discard_on_fail=False, checkpoint_size=None):
     """Like _run_batch(), but for a heterogeneous list of jobs spanning
     MORE than one (block, topology) at once -- needed for a hierarchical
     block's own Monte Carlo generation (see generate_hierarchical_param_set()),
@@ -278,16 +414,48 @@ def _run_hierarchical_batch(jobs, defaults, force, skip_on_fail_profile=None):
     that one simple and unchanged instead of threading per-item
     block/topology through code that has never needed it before.
 
-    skip_on_fail_profile is forwarded unchanged to every job's own
-    run_variation() call -- each job's own block=job["block"] is what makes
-    this safe even though jobs span different blocks (cmos_vref/output_amp
-    under a "top" run, each with their own declared profiles): a profile
-    name not declared for a given job's own block just resolves to an empty
-    constraints dict there (see run_variation()'s own profile lookup),
-    never disqualifying that job -- a deliberate, permissive default for a
-    name that simply doesn't apply to that sub-block."""
+    skip_on_fail_profile/skip_on_fail_max_failures are forwarded unchanged
+    to every job's own run_variation() call -- each job's own
+    block=job["block"] is what makes this safe even though jobs span
+    different blocks (cmos_vref/output_amp under a "top" run, each with
+    their own declared profiles): a profile name not declared for a given
+    job's own block just resolves to an empty constraints dict there (see
+    run_variation()'s own profile lookup), never disqualifying that job --
+    a deliberate, permissive default for a name that simply doesn't apply
+    to that sub-block.
+
+    discard_on_fail is NEVER forwarded to a sub-block job's own
+    run_variation() call -- only a job carrying its own "discard_with" key
+    (a top-level "top" job, added by main() right where it already knows
+    that iteration's freshly-generated sub-job names, see
+    generate_hierarchical_param_set()) can trigger a discard, and it does
+    so for BOTH itself and every name in its own "discard_with" list --
+    those sub-block variations were sampled JUST for this one composed
+    attempt (never reused across iterations), so a discarded "top" always
+    takes its own ingredient sub-blocks down with it, whatever their own
+    individual pass/fail happened to be. A plain sub-job (no "discard_with"
+    key) is therefore only ever discarded as part of its parent's own
+    outcome, never on its own -- same deferred trim_variation() timing as
+    _run_batch(), for the identical concurrency reason (see that
+    function's own docstring: safe the moment a chunk's own worker(s) have
+    all finished, not only once at the very end of the whole batch).
+
+    checkpoint_size -- see _run_batch()'s own docstring for the general
+    idea (periodic trim_variation() of this batch's own discards instead
+    of leaving them all until the very end, auto-enabled at
+    DEFAULT_CHECKPOINT_MULTIPLIER * workspace.cpu_budget() the moment
+    discard_on_fail is True, unless overridden). The one difference here:
+    it counts in SAMPLES (one whole composed "top" attempt, sub-jobs
+    included), not raw jobs -- see _iterations()'s own docstring for why a
+    plain job-count chunk boundary would risk splitting one sample's own
+    sub-jobs from its own top-level job across two different checkpoints
+    for no reason."""
     max_workers = workspace.cpu_budget()
     shadow = max_workers > 1
+    if discard_on_fail and checkpoint_size is None:
+        checkpoint_size = max(1, DEFAULT_CHECKPOINT_MULTIPLIER * max_workers)
+    elif not discard_on_fail:
+        checkpoint_size = None
     existing_names = {r["name"] for r in _read_jsonl(workspace.PROJECT_ROOT / "sim" / "variations.jsonl")}
     any_error = False
 
@@ -325,6 +493,8 @@ def _run_hierarchical_batch(jobs, defaults, force, skip_on_fail_profile=None):
                 job["block_cfg"], job["tests"], defaults, job["params"], force=force,
                 container_ctx=container_ctx, origin=job["origin"], shadow=shadow, log_prefix=log_prefix,
                 block=job["block"], topology=job["topology"], skip_on_fail_profile=skip_on_fail_profile,
+                skip_on_fail_max_failures=skip_on_fail_max_failures,
+                discard_on_fail=discard_on_fail and "discard_with" in job,
             )
         except Exception as exc:
             # See _run_batch's own identical try/except for why this can't
@@ -335,20 +505,77 @@ def _run_hierarchical_batch(jobs, defaults, force, skip_on_fail_profile=None):
             print(f"{log_prefix}{name}: ERROR (unexpected exception: {exc})")
             print(f"{log_prefix}{traceback.format_exc()}")
             emit_progress_variation_done(name, time.monotonic() - start_ts, True)
-            return {"variation": name, "any_error": True}
+            return {"variation": name, "any_error": True, "discard": False}
+
+    def _collect_discard(job, outcome):
+        # Gated on "discard_with" in job (a top-level job only), NOT just
+        # outcome.get("discard") alone -- belt-and-suspenders alongside
+        # _run_one()'s own discard_on_fail=discard_on_fail and "discard_with"
+        # in job: a sub-job's own run_variation() call is always forced
+        # discard_on_fail=False, so its own outcome should never actually
+        # carry "discard": True in practice, but this function must not
+        # ALSO independently trim a sub-job on its own if it somehow did --
+        # only a top-level job's own discard takes its "discard_with" list
+        # down with it (see this function's own caller's docstring).
+        if "discard_with" not in job or not outcome.get("discard"):
+            return []
+        return [outcome["variation"], *job["discard_with"]]
+
+    to_discard = []
+    discarded_total = 0
+
+    def _checkpoint():
+        nonlocal to_discard, discarded_total
+        if not to_discard:
+            return
+        for name in to_discard:
+            trim_variation(name)
+        discarded_total += len(to_discard)
+        print(f"checkpoint: discarded {len(to_discard)} variation(s) (composed job(s) that disqualified "
+              f"{skip_on_fail_profile!r} plus their own freshly-generated sub-blocks, {discarded_total} "
+              f"total so far): {', '.join(to_discard)}")
+        to_discard = []
+
+    # Both branches below chunk the SAME way: groups of `checkpoint_size`
+    # consecutive samples (_iterations(jobs) -- each group is one composed
+    # attempt's own sub-jobs + its own top-level job), flattened back into
+    # a plain job list per chunk. checkpoint_size=None (discard_on_fail
+    # off) collapses to exactly one chunk holding everything -- unchanged
+    # from before this feature existed.
+    groups = list(_iterations(jobs)) if checkpoint_size else [jobs]
+    chunks = (
+        [groups[start:start + checkpoint_size] for start in range(0, len(groups), checkpoint_size)]
+        if checkpoint_size else [groups]
+    )
 
     with managed_container() as container:
         container_ctx = setup_container(container)
-        if max_workers <= 1:
-            for i, job in enumerate(jobs):
-                outcome = _run_one(i, job)
-                existing_names.add(outcome["variation"])
-                any_error = any_error or outcome["any_error"]
-        else:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-                futures = [pool.submit(_run_one, i, job) for i, job in enumerate(jobs)]
-                for future in concurrent.futures.as_completed(futures):
-                    any_error = any_error or future.result()["any_error"]
+        offset = 0
+        for chunk_groups in chunks:
+            chunk = [job for group in chunk_groups for job in group]
+            if max_workers <= 1:
+                for j, job in enumerate(chunk):
+                    outcome = _run_one(offset + j, job)
+                    existing_names.add(outcome["variation"])
+                    any_error = any_error or outcome["any_error"]
+                    to_discard.extend(_collect_discard(job, outcome))
+            else:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+                    futures = {pool.submit(_run_one, offset + j, job): job for j, job in enumerate(chunk)}
+                    for future in concurrent.futures.as_completed(futures):
+                        outcome = future.result()
+                        any_error = any_error or outcome["any_error"]
+                        to_discard.extend(_collect_discard(futures[future], outcome))
+            offset += len(chunk)
+            # Safe here: every job in this chunk has finished (sequential
+            # mode never had concurrency to begin with; parallel mode's
+            # executor `with` block just exited, fully drained) -- see
+            # _run_batch()'s own identical checkpoint comment. Every chunk
+            # (there's always at least one, even with checkpoint_size=None)
+            # ends with this same call, so nothing is ever left over for a
+            # separate final flush after the loop, unlike _run_batch()'s own
+            # sequential branch (which only checkpoints every Nth item).
+            _checkpoint()
 
     return any_error
 
@@ -369,6 +596,24 @@ def main():
         help="stop simulating a variation's remaining tests the moment they'd already disqualify PROFILE "
              "(a config.json blocks.<block>.profiles name) -- opt-in, off by default",
     )
+    parser.add_argument(
+        "--skip-on-fail-max-failures", type=int, default=0, metavar="N",
+        help="tolerate up to N already-violated constraints of --skip-on-fail's own PROFILE before actually "
+             "stopping (default 0: any single violation stops it) -- requires --skip-on-fail",
+    )
+    parser.add_argument(
+        "--discard-on-fail", action="store_true",
+        help="when --skip-on-fail (beyond --skip-on-fail-max-failures) actually stops a variation, trim it "
+             "entirely (and, for a hierarchical block, its own freshly-generated sub-block variations too) "
+             "instead of leaving it registered with partial results -- requires --skip-on-fail",
+    )
+    parser.add_argument(
+        "--checkpoint-size", type=int, default=None, metavar="N",
+        help="with --discard-on-fail, trim discarded variations every N samples instead of waiting for the "
+             f"whole batch to finish -- keeps disk usage bounded on a long, low-hit-rate search. Auto-sizes to "
+             f"{DEFAULT_CHECKPOINT_MULTIPLIER} * the container.cpu_budget setting when --discard-on-fail is on "
+             "and this is left unset; pass an explicit N to override. Requires --discard-on-fail",
+    )
     parser.add_argument("--seed", type=int, default=None, help="random seed, for reproducible batches")
     parser.add_argument("--project-root", default=None, help="project folder to operate on; defaults to the last-opened folder, else CWD")
     parser.add_argument("--block", default=None, help="block to operate on; defaults to the first declared in config.json")
@@ -377,6 +622,9 @@ def main():
 
     workspace.open_folder(args.project_root, block=args.block, topology=args.topology)
     validate_skip_on_fail_profile(args.skip_on_fail)
+    validate_skip_on_fail_tolerance(
+        args.skip_on_fail, args.skip_on_fail_max_failures, args.discard_on_fail, args.checkpoint_size,
+    )
     config = workspace.CONFIG
     defaults = config["defaults"]
     block_cfg = config["blocks"][workspace.BLOCK]["topologies"][workspace.TOPOLOGY]
@@ -403,14 +651,31 @@ def main():
             jobs.append({
                 "block_cfg": block_cfg, "tests": tests, "block": workspace.BLOCK,
                 "topology": workspace.TOPOLOGY, "params": top_params, "origin": {"kind": "random"},
+                # This top-level job's own freshly-generated sub-block
+                # variations (just registered above, single-use for this
+                # one composed attempt) -- present ONLY on a top-level job,
+                # never a sub-job itself, so _run_hierarchical_batch() can
+                # tell the two apart (see its own discard_on_fail docstring).
+                "discard_with": [
+                    variation_name(job["block"], job["topology"], job["params"]) for job in sub_jobs
+                ],
             })
-        any_error = _run_hierarchical_batch(jobs, defaults, args.force, skip_on_fail_profile=args.skip_on_fail)
+        any_error = _run_hierarchical_batch(
+            jobs, defaults, args.force, skip_on_fail_profile=args.skip_on_fail,
+            skip_on_fail_max_failures=args.skip_on_fail_max_failures, discard_on_fail=args.discard_on_fail,
+            checkpoint_size=args.checkpoint_size,
+        )
     else:
         # sampled sequentially (rng.uniform() isn't thread-safe) before handing
         # off to _run_batch, which may then simulate them concurrently --
         # keeps --seed reproducible regardless of workspace.cpu_budget().
         param_sets = [random_params(block_cfg["parameters"], rng, spread_pct=args.spread) for _ in range(args.count)]
-        any_error = _run_batch(param_sets, block_cfg, tests, defaults, args.force, origin={"kind": "random"}, skip_on_fail_profile=args.skip_on_fail)
+        any_error = _run_batch(
+            param_sets, block_cfg, tests, defaults, args.force, origin={"kind": "random"},
+            skip_on_fail_profile=args.skip_on_fail,
+            skip_on_fail_max_failures=args.skip_on_fail_max_failures, discard_on_fail=args.discard_on_fail,
+            checkpoint_size=args.checkpoint_size,
+        )
 
     sys.exit(1 if any_error else 0)
 

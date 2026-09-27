@@ -7,7 +7,7 @@ max) bound checking -- the fix for a metric only being able to satisfy one
 direction when it reported a single float."""
 import unittest
 
-from analog_designer.results.fom import classify, constraint_satisfied, metrics_to_variables, slugify
+from analog_designer.results.fom import classify, constraint_satisfied, constraints_violated, metrics_to_variables, slugify
 
 
 def _metric(name, typical, lo, hi):
@@ -110,6 +110,47 @@ class ClassifyTests(unittest.TestCase):
         results = classify(block_cfg, metrics)
         self.assertFalse(results[0]["matched"])
         self.assertEqual(results[0]["n_satisfied"], 0)
+
+
+class ConstraintsViolatedTests(unittest.TestCase):
+    """max_failures's own tolerance (default 0 == the original "any single
+    violation ends it" behavior) -- see run_variation()'s own skip_on_fail
+    early exit, the sole caller of this function."""
+
+    def _variables(self, **maxima):
+        """One violated/satisfied constraint per kwarg: current=1.5 with a
+        maximum=1.0 bound is violated (observed_max breaches it), current=0.5
+        is satisfied."""
+        metrics = [_metric(name, value, value, value) for name, value in maxima.items()]
+        return metrics_to_variables(metrics)
+
+    def _constraints(self, *names):
+        return {name: {"maximum": 1.0} for name in names}
+
+    def test_default_max_failures_stops_at_the_first_violation(self):
+        constraints = self._constraints("a", "b")
+        variables = self._variables(a=1.5, b=0.5)  # a violated, b satisfied
+        self.assertTrue(constraints_violated(constraints, variables))
+
+    def test_no_violations_is_never_flagged_regardless_of_max_failures(self):
+        constraints = self._constraints("a", "b")
+        variables = self._variables(a=0.5, b=0.5)
+        self.assertFalse(constraints_violated(constraints, variables, max_failures=5))
+
+    def test_violations_within_max_failures_are_tolerated(self):
+        constraints = self._constraints("a", "b", "c")
+        variables = self._variables(a=1.5, b=1.5, c=0.5)  # 2 violated, 1 satisfied
+        self.assertFalse(constraints_violated(constraints, variables, max_failures=2))
+
+    def test_violations_beyond_max_failures_still_trip_it(self):
+        constraints = self._constraints("a", "b", "c")
+        variables = self._variables(a=1.5, b=1.5, c=1.5)  # 3 violated
+        self.assertTrue(constraints_violated(constraints, variables, max_failures=2))
+
+    def test_a_metric_not_simulated_yet_never_counts_as_a_violation(self):
+        constraints = {"a": {"maximum": 1.0}, "not_run_yet": {"maximum": 1.0}}
+        variables = self._variables(a=0.5)
+        self.assertFalse(constraints_violated(constraints, variables, max_failures=0))
 
 
 if __name__ == "__main__":

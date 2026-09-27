@@ -118,6 +118,13 @@ class App(ttk.Frame):
         # own skip_on_fail_profile.
         self._run_force = False
         self._skip_on_fail_profile = None
+        # Only create_variation_dialog's own Monte Carlo tab exposes these
+        # today (see add_skip_fail_tolerance_fields) -- meaningless without
+        # a profile, so both reset to (0, False) wherever _skip_on_fail_profile
+        # itself gets reset for a block switch (see below, in this same
+        # class's own block/topology-change handler).
+        self._skip_on_fail_max_failures = 0
+        self._discard_on_fail = False
         self.trigger = RunTrigger(on_line=self._log, on_done=self._on_run_done)
         self.selected_variation = None
         self._active_job = None  # "update" | "update_range" | "create" | None -- a pro subclass adds several more job kinds of its own
@@ -202,6 +209,7 @@ class App(ttk.Frame):
         data_menu.add_separator()
         data_menu.add_command(label="Purge Stale Results...", command=self._purge_stale_selected)
         data_menu.add_command(label="Purge Plots...", command=self._purge_plots_selected)
+        data_menu.add_command(label="Purge Raw Sim Outputs...", command=self._purge_aux_selected)
         menubar.add_cascade(label="Data", menu=data_menu)
 
         self._menus = {"variation": variation_menu, "run": run_menu, "data": data_menu}
@@ -402,6 +410,8 @@ class App(ttk.Frame):
         # choice forward.
         if self._skip_on_fail_profile not in workspace.CONFIG["blocks"][workspace.BLOCK].get("profiles", {}):
             self._skip_on_fail_profile = None
+            self._skip_on_fail_max_failures = 0
+            self._discard_on_fail = False
         self.reload()
 
     def _open_docker_settings(self):
@@ -562,24 +572,37 @@ class App(ttk.Frame):
         self._start_job(job, argv, status)
 
     def _trim_selected(self):
+        """Deletes one or more variations entirely (variations.jsonl/
+        results.jsonl rows + sim/<name>/ dir) -- same Shift/Ctrl-click range
+        selection as _start_update()'s own VariationsTable.selected_variations()
+        (a Monte Carlo batch's worth of bad candidates at once, not just
+        whichever single row happens to be the "selected" one for the
+        detail/params panels)."""
         if self.trigger.running:
             return
-        if not self.selected_variation:
-            messagebox.showinfo("Trim", "Select a variation first.")
+        names = self.table.selected_variations()
+        if not names:
+            messagebox.showinfo("Trim", "Select one or more variations first.")
             return
-        name = self.selected_variation
-        if not messagebox.askyesno("Trim variation", f"Delete {name} and all its simulation data? This cannot be undone."):
+        message = (
+            f"Delete {names[0]} and all its simulation data? This cannot be undone."
+            if len(names) == 1 else
+            f"Delete {len(names)} selected variations and all their simulation data? This cannot be undone."
+        )
+        if not messagebox.askyesno("Trim variation(s)", message):
             return
-        run_sim.trim_variation(name)
-        self.selected_variation = None
-        self.detail.clear()
-        self.params_panel.clear()
-        self.status_var.set(f"trimmed {name}")
+        for name in names:
+            run_sim.trim_variation(name)
+        if self.selected_variation in names:
+            self.selected_variation = None
+            self.detail.clear()
+            self.params_panel.clear()
+        self.status_var.set(f"trimmed {len(names)} variation(s)" if len(names) > 1 else f"trimmed {names[0]}")
         self.reload()
 
     def _purge_stale_selected(self):
         """Data menu action: physically deletes results.jsonl rows (and
-        their now-orphaned plot PNGs) for whichever (variation, test) pairs
+        their now-orphaned run dirs and plot PNGs) for whichever (variation, test) pairs
         are flagged stale among the selected rows -- see
         run_sim.purge_stale_results's own docstring for how that differs
         from Trim (which deletes a whole variation) and from just leaving
@@ -626,6 +649,26 @@ class App(ttk.Frame):
         if self.selected_variation in names:
             self.detail.show(self.selected_variation)
         self.reload()
+
+    def _purge_aux_selected(self):
+        """Data menu action: deletes leftover .raw files and side dumps
+        (e.g. '_diag.data') from the selected variations' run dirs -- see
+        run_sim.purge_aux_outputs. Results and plots are unaffected; new
+        runs don't write these to the project folder at all anymore."""
+        if self.trigger.running:
+            return
+        names = self.table.selected_variations()
+        if not names:
+            messagebox.showinfo("Purge Raw Sim Outputs", "Select one or more variations first.")
+            return
+        if not messagebox.askyesno(
+            "Purge Raw Sim Outputs",
+            f"Delete .raw files and debug data dumps for {len(names)} selected variation(s)? "
+            "Results and plots are not affected.",
+        ):
+            return
+        n, freed = run_sim.purge_aux_outputs(names)
+        self.status_var.set(f"purged {n} raw output file(s), {freed / 1e6:.0f} MB, for {len(names)} selected variation(s)")
 
     def _export_release(self):
         """Exports the selected variation as its block's release pick --
@@ -674,15 +717,22 @@ class App(ttk.Frame):
             self, config, workspace.BLOCK, workspace.TOPOLOGY, data.load_variations(), param_defs,
             self._run_force, self._skip_on_fail_profile, initial_tab=initial_tab,
             default_parent=self.selected_variation,
+            skip_on_fail_max_failures=self._skip_on_fail_max_failures, discard_on_fail=self._discard_on_fail,
         )
         if result is None:
             return
         self._run_force, self._skip_on_fail_profile = result["force"], result["skip_on_fail_profile"]
+        self._skip_on_fail_max_failures = result["skip_on_fail_max_failures"]
+        self._discard_on_fail = result["discard_on_fail"]
         argv, status = self._create_argv(result)
         if self._run_force:
             argv.append("--force")
         if self._skip_on_fail_profile:
             argv += ["--skip-on-fail", self._skip_on_fail_profile]
+            if self._skip_on_fail_max_failures:
+                argv += ["--skip-on-fail-max-failures", str(self._skip_on_fail_max_failures)]
+            if self._discard_on_fail:
+                argv.append("--discard-on-fail")
         argv += self._scope_args()
         self._start_job("create", argv, status)
 

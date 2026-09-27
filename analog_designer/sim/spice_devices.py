@@ -1,7 +1,7 @@
 """Per-instance terminal/net extraction from an xschem-expanded netlist --
 `analog_designer.sim.soa_check` needs to know which NET is attached to each
 transistor's gate/drain/source/bulk to compute Vgs/Vds/Vgb/Vdb/Vsb straight
-from saved node-voltage waveforms (see raw_reader.py), rather than trusting
+from saved node-voltage waveforms (see raw_peaks.py), rather than trusting
 the PSP103 model's own internal SOA check (confirmed live, 2026-09-06: that
 check's VDB_MAX/VSB_MAX values are wrong for HV -- see soa_check.py's own
 docstring).

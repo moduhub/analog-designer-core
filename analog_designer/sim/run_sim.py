@@ -42,6 +42,7 @@ import math
 import operator
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -52,7 +53,7 @@ from pathlib import Path
 from analog_designer.core import workspace
 from analog_designer.results import fom
 from analog_designer.sim import log_diagnostics
-from analog_designer.sim import raw_reader
+from analog_designer.sim import raw_peaks
 from analog_designer.sim import soa_check
 from analog_designer.sim import spice_devices
 from analog_designer.sim.spice_value import _match, format_spice_value, parse_spice_value
@@ -1355,10 +1356,12 @@ def purge_stale_results(names):
     and importing data.py back would be a cycle -- same reason this module
     keeps its own _read_jsonl instead of data.py's). Scoped to `names` (an
     iterable of variation names) -- other variations' stale results are
-    untouched. Also deletes that (variation, test)'s now-orphaned plot PNGs.
-    Unlike trim_variation, leaves the variation and any still-fresh
-    (variation, test) results alone. Returns how many (variation, test) keys
-    were purged."""
+    untouched. Also deletes that (variation, test)'s now-orphaned
+    sim/<variation>/<test>/ dir (per-condition outputs and plot PNGs) --
+    nothing reads it once its results rows are gone, and a rerun rewrites it
+    from scratch anyway. Unlike trim_variation, leaves the variation and any
+    still-fresh (variation, test) results alone. Returns how many
+    (variation, test) keys were purged."""
     names = set(names)
     results_path = workspace.PROJECT_ROOT / "sim" / "results.jsonl"
     rows = [r for r in _read_jsonl(results_path) if r["variation"] in names]
@@ -1397,9 +1400,31 @@ def purge_stale_results(names):
     _rewrite_jsonl(results_path, lambda r: (r["variation"], r["test"]) not in stale_keys)
     for variation, test in stale_keys:
         test_dir = workspace.PROJECT_ROOT / "sim" / variation / test
-        for png in test_dir.glob(f"{test}*.png"):
-            png.unlink()
+        if test_dir.is_dir():
+            shutil.rmtree(test_dir)
     return len(stale_keys)
+
+
+def purge_aux_outputs(names):
+    """Delete auxiliary simulator outputs left in sim/<variation>/<test>/
+    <condition>/ run dirs for each name in `names`: every .raw, and every
+    '<test>_0_*.data' side dump (e.g. startup's '_diag.data') -- never the
+    canonical '<test>_0.data' the parser and lazy plots read. New runs
+    don't leave these behind at all (see _AUX_SCRATCH_ROOT); this clears
+    ones written before that, or kept via KEEP_AUX_ENV. Returns
+    (files removed, bytes freed)."""
+    removed = freed = 0
+    for name in names:
+        sim_dir = workspace.PROJECT_ROOT / "sim" / name
+        if not sim_dir.is_dir():
+            continue
+        for test_dir in (p for p in sim_dir.iterdir() if p.is_dir()):
+            for path in test_dir.glob("*/*"):
+                if path.suffix == ".raw" or (path.suffix == ".data" and path.name.startswith(f"{test_dir.name}_0_")):
+                    freed += path.stat().st_size
+                    path.unlink()
+                    removed += 1
+    return removed, freed
 
 
 def purge_plots(names):
@@ -1575,8 +1600,18 @@ def condition_matrix(test_cfg, defaults, sweep_axis):
         conditions.pop(sweep_axis[0], None)
     corners = conditions.pop("corner", [defaults["corner"]])
     if sweep_axis and sweep_axis[0] == "temperature":
-        for corner in corners:
-            yield {"corner": corner}
+        # Still generalizes to any OTHER multi-valued conditions{} key left
+        # after popping corner/typical/the swept axis itself (e.g. a vdd
+        # list carrying both the nominal 3v3 supply and an informational
+        # corner-case supply, folded into temp_sweep's own conditions
+        # instead of a separately-duplicated test) -- same mechanism as the
+        # non-collapsed path below, just crossed with corner only, never
+        # with temperature (that's still swept internally, one .dc per run).
+        axes = {"corner": corners}
+        axes.update({key: values for key, values in conditions.items() if len(values) > 1})
+        keys = list(axes)
+        for combo in itertools.product(*(axes[key] for key in keys)):
+            yield dict(zip(keys, combo))
         return
     temperatures = conditions.pop("temperature", [defaults["temperature"]])
     axes = {"corner": corners, "temperature": temperatures}
@@ -1689,6 +1724,9 @@ def _netlist(container, test_name, tb_source, conditions, tb_params_base,
         f'-n -x -q -o "{container_run_dir}" "{container_run_dir}/{tb_source.name}"'
     )
     netlist_path = run_dir / f"{tb_source.stem}.spice"
+    # A leftover netlist (earlier run, or run_one_ngspice()'s own retry)
+    # would satisfy the exists() check below even if xschem wrote nothing.
+    netlist_path.unlink(missing_ok=True)
     for attempt in range(1, _NETLIST_MAX_ATTEMPTS + 1):
         result = docker_exec(container, netlist_cmd)
         if netlist_path.exists():
@@ -1711,34 +1749,128 @@ def _netlist(container, test_name, tb_source, conditions, tb_params_base,
     return netlist_path
 
 
-def _soa_diagnostics_from_raw(netlist_path, raw_path):
-    """SOA (Safe Operating Area) diagnostics for one simulation run, straight
-    from the real node-voltage waveforms it wrote -- see soa_check.py's own
-    docstring for why this replaced the earlier PSP103-model-warning-based
-    approach. `raw_path` is the ascii `.raw` a testbench's own .control
-    block writes via `save all` + `set filetype=ascii` + `write ...` (only
-    tb_vref_power.sch/tb_vref_startup.sch do this today, see those files'
-    own comments) -- a testbench that doesn't write one simply gets no SOA
-    diagnostics, same as before this existed. Needs
-    workspace.CONFIG["technology"]["mosfet_limits"] (config.json) to have
-    anything to compare against; returns [] if that's absent too."""
-    if not raw_path.exists():
-        return []
+# Auxiliary simulator outputs -- every `write`/`wrdata` target in a
+# testbench's .control block OTHER than the canonical '<test>_0.data' its
+# parser reads (the `save all` .raw feeding the SOA check, debug dumps like
+# tb_vref_startup's '_diag.data') -- are redirected by
+# _redirect_aux_outputs() to container-local scratch under this root instead
+# of the project bind mount. Nothing reads them after the run itself: the
+# .raw is reduced to SOA peaks inside the container (raw_peaks.py) and the
+# lazy plots (generate_plot()) replay only the .data. Measured on
+# ihp_mh_ip__cmos_vref's startup test (2026-09-26): one condition's ASCII
+# .raw is ~40MB, and writing it through Docker Desktop's bind mount took
+# that run from 2.0s to 7.9s -- ~9GB across 174 variations, and the
+# dominant I/O contention in a parallel batch. The container is --rm (see
+# managed_container()), so anything a crashed run leaves here goes with it.
+_AUX_SCRATCH_ROOT = "/tmp/analog_designer_aux"
+
+# Set to a non-empty, non-"0" value to copy a run's auxiliary outputs back
+# into its run dir anyway (debugging a testbench). They're always kept for a
+# run whose ngspice exited non-zero.
+KEEP_AUX_ENV = "ANALOG_DESIGNER_KEEP_SIM_AUX"
+
+_AUX_OUTPUT_RE = re.compile(r"^(?P<cmd>write|wrdata)\s+(?P<path>\S+)(?P<rest>.*)$", re.IGNORECASE)
+_SOA_PEAKS_MARKER = "@@analog_designer:soa_peaks@@"
+
+
+def _keep_aux_outputs():
+    return os.environ.get(KEEP_AUX_ENV, "") not in ("", "0")
+
+
+def _redirect_aux_outputs(netlist_path, container_run_dir, scratch_dir, primary_name):
+    """Rewrites every `write`/`wrdata` line targeting a file directly in
+    container_run_dir, other than primary_name, to target scratch_dir
+    instead (see _AUX_SCRATCH_ROOT). If any `write` (a .raw) moved, also
+    flips `set filetype=ascii` to binary -- ~3x smaller and far cheaper to
+    both write and parse, and raw_peaks.read_raw() reads either; the ASCII
+    setting only existed for the old host-side reader. Returns
+    {"write": [names], "wrdata": [names]} of what moved."""
+    lines = netlist_path.read_text(encoding="utf-8").splitlines()
+    prefix = container_run_dir.rstrip("/") + "/"
+    moved = {"write": [], "wrdata": []}
+    for i, line in enumerate(lines):
+        match = _AUX_OUTPUT_RE.match(line.strip())
+        if not match or not match.group("path").startswith(prefix):
+            continue
+        name = match.group("path")[len(prefix):]
+        if name == primary_name or "/" in name:
+            continue
+        lines[i] = f"{match.group('cmd')} {scratch_dir}/{name}{match.group('rest')}"
+        moved[match.group("cmd").lower()].append(name)
+    if not (moved["write"] or moved["wrdata"]):
+        return moved
+    if moved["write"]:
+        lines = ["set filetype=binary" if l.strip().lower() == "set filetype=ascii" else l for l in lines]
+    netlist_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return moved
+
+
+def _soa_setup(netlist_path):
+    """(devices, limits, pairs) for the SOA (Safe Operating Area) check of
+    one run -- see soa_check.py's own docstring for why this reads real
+    node-voltage waveforms instead of the earlier PSP103-model-warning-based
+    approach. None if config.json has no technology.mosfet_limits to compare
+    against."""
     limits = (workspace.CONFIG or {}).get("technology", {}).get("mosfet_limits")
     if not limits:
-        return []
+        return None
     netlist_text = netlist_path.read_text(encoding="utf-8")
     devices = spice_devices.extract_mosfets(netlist_text)
     subckt_name = spice_devices.find_dut_subckt(netlist_text)
     if subckt_name:
         devices = spice_devices.resolve_hierarchical_nets(netlist_text, devices, subckt_name)
-    raw_data = raw_reader.read_ascii_raw(raw_path)
-    return soa_check.check_soa(devices, raw_data, limits)
+    return devices, limits, soa_check.soa_pairs(devices, limits)
+
+
+def _soa_peaks_command(raw_path, pairs):
+    """Shell snippet (appended to the ngspice exec) that runs raw_peaks.py
+    against raw_path inside the container and prints its JSON after
+    _SOA_PEAKS_MARKER -- the script's own source travels in a heredoc, so
+    nothing needs installing in the image beyond python3."""
+    source = Path(raw_peaks.__file__).read_text(encoding="utf-8")
+    return (
+        f'if [ -f "{raw_path}" ]; then echo "{_SOA_PEAKS_MARKER}"; '
+        f'python3 - "{raw_path}" {shlex.quote(json.dumps(pairs))} 2>&1 <<\'AD_RAW_PEAKS_PY\'\n'
+        f"{source}\nAD_RAW_PEAKS_PY\nfi"
+    )
+
+
+def _soa_diagnostics(soa, peaks_output):
+    """Diagnostics from raw_peaks.py's in-container output. A reducer
+    failure (no python3 in some other image, a malformed .raw) becomes one
+    visible warning rather than silently skipping the check."""
+    devices, limits, _ = soa
+    try:
+        peaks = {(a, b): peak for a, b, peak in json.loads(peaks_output)}
+    except (ValueError, TypeError):
+        first_line = (peaks_output.strip().splitlines() or ["no output"])[-1]
+        return [{
+            "severity": "warning", "category": "soa_check_failed", "key": "soa_check_failed",
+            "message": f"SOA check could not read the .raw: {first_line}", "count": 1,
+        }]
+    return soa_check.check_soa(devices, peaks, limits)
 
 
 def run_one_ngspice(container, test_name, tb_source, conditions, tb_params_base,
                      run_dir, container_run_dir, container_rcfile, ctx,
                      block_cfg=None, block=None, topology=None, sim_timeout=290, n_threads=1):
+    """One ngspice condition: netlist + simulate, retried once when ngspice
+    reports an "unknown subckt" -- xschem intermittently emits a netlist
+    with a hierarchical block's .subckt expansion silently absent (~0.7% of
+    all runs across ihp_mh_ip__cmos_vref's history, spread over every test,
+    never reproducible on its own -- 84/84 clean under 28-way concurrent
+    netlisting, 2026-09-26), which _netlist()'s "IS MISSING" check can't
+    see. A genuinely missing subckt just fails the same way twice."""
+    args = (container, test_name, tb_source, conditions, tb_params_base,
+            run_dir, container_run_dir, container_rcfile, ctx, sim_timeout, n_threads)
+    outcome = _run_one_ngspice_attempt(*args)
+    if outcome["status"] == "error" and "unknown subckt" in (outcome.get("error") or ""):
+        outcome = _run_one_ngspice_attempt(*args)
+    return outcome
+
+
+def _run_one_ngspice_attempt(container, test_name, tb_source, conditions, tb_params_base,
+                             run_dir, container_run_dir, container_rcfile, ctx, sim_timeout, n_threads):
     run_dir.mkdir(parents=True, exist_ok=True)
     # `set num_threads=<n_threads>` here is what actually governs this run's
     # thread count (see THREAD_POLICY/run_test()): read AFTER the
@@ -1770,6 +1902,13 @@ def run_one_ngspice(container, test_name, tb_source, conditions, tb_params_base,
     data_file = run_dir / f"{test_name}_0.data"
     data_file.unlink(missing_ok=True)
 
+    # Unique per (variation, test, condition) since it mirrors the run
+    # dir's own container path -- concurrent conditions never share one.
+    scratch_dir = f"{_AUX_SCRATCH_ROOT}/{container_run_dir.lstrip('/')}"
+    aux = _redirect_aux_outputs(netlist_path, container_run_dir, scratch_dir, data_file.name)
+    soa_raw = f"{test_name}_0.raw"
+    soa = _soa_setup(netlist_path) if soa_raw in aux["write"] else None
+
     # `timeout` runs INSIDE the container so a non-converging ngspice run
     # actually gets killed (SIGTERM, then SIGKILL if it ignores that) --
     # docker_exec()'s own timeout= only kills the local `docker exec`
@@ -1791,15 +1930,32 @@ def run_one_ngspice(container, test_name, tb_source, conditions, tb_params_base,
     # _cap_ngspice_threads()'s docstring), but keeps this exec's declared
     # thread budget visible/correct for anything else in the process tree
     # that DOES read OMP_NUM_THREADS normally (e.g. a BLAS library).
+    # Auxiliary outputs (see _AUX_SCRATCH_ROOT) are reduced and cleaned up
+    # in this SAME exec, right after ngspice -- one docker exec per
+    # condition, same as before they existed; `exit $rc` keeps ngspice's
+    # own exit code as the exec's.
     sim_cmd = (
         f'cd "{container_run_dir}" && export OMP_NUM_THREADS={n_threads}; '
         f'timeout {sim_timeout} ngspice -b {tb_source.stem}.spice'
     )
-    sim_result = docker_exec(container, sim_cmd, timeout=sim_timeout + 10)
-    log_text = sim_result.stdout + "\n" + sim_result.stderr
+    if aux["write"] or aux["wrdata"]:
+        keep_back = "true" if _keep_aux_outputs() else '[ "$rc" -ne 0 ]'
+        sim_cmd = "\n".join(filter(None, [
+            f'mkdir -p "{scratch_dir}"',
+            sim_cmd,
+            "rc=$?",
+            _soa_peaks_command(f"{scratch_dir}/{soa_raw}", soa[2]) if soa else None,
+            f'if {keep_back}; then cp -r "{scratch_dir}/." "{container_run_dir}/"; fi',
+            f'rm -rf "{scratch_dir}"',
+            "exit $rc",
+        ]))
+    sim_result = docker_exec(container, sim_cmd, timeout=sim_timeout + 30)
+    stdout, _, soa_output = sim_result.stdout.partition(_SOA_PEAKS_MARKER + "\n")
+    log_text = stdout + "\n" + sim_result.stderr
     (run_dir / "ngspice.log").write_text(log_text, encoding="utf-8")
     diagnostics = log_diagnostics.parse(log_text, "ngspice")
-    diagnostics += _soa_diagnostics_from_raw(netlist_path, run_dir / f"{test_name}_0.raw")
+    if soa and soa_output:
+        diagnostics += _soa_diagnostics(soa, soa_output)
     # returncode/file-existence alone isn't enough: ngspice can exit 0 and
     # still leave behind a data file after an analysis-level failure --
     # confirmed live for two distinct real cases, both already caught by
@@ -2700,7 +2856,7 @@ def materialize_variation_shadow(sim_dir, block_cfg, params, block=None):
     return f"{container_sim_dir}/_src/xschemrc"
 
 
-def run_variation(block_cfg, tests, defaults, params, force=False, container_ctx=None, origin=None, shadow=False, log_prefix="", block=None, topology=None, skip_on_fail_profile=None):
+def run_variation(block_cfg, tests, defaults, params, force=False, container_ctx=None, origin=None, shadow=False, log_prefix="", block=None, topology=None, skip_on_fail_profile=None, skip_on_fail_max_failures=0, discard_on_fail=False):
     """Materialize + simulate one (block, topology, params) variation --
     block/topology default to whichever workspace.open_folder() resolved
     (workspace.BLOCK/workspace.TOPOLOGY), unchanged for every existing
@@ -2748,8 +2904,37 @@ def run_variation(block_cfg, tests, defaults, params, force=False, container_ctx
     config.json declares each block's expensive Monte Carlo sweeps last,
     so this naturally skips exactly those once a cheap earlier test has
     already shown the design can't qualify, without needing to know which
-    tests are "expensive" explicitly. Returns
-    {"variation": name, "any_error": bool}."""
+    tests are "expensive" explicitly.
+
+    skip_on_fail_max_failures (default 0, i.e. the original "any single
+    violation ends it" behavior) tolerates that many already-violated
+    constraints of skip_on_fail_profile before the early exit actually
+    triggers -- see fom.constraints_violated()'s own max_failures. Ignored
+    when skip_on_fail_profile is None.
+
+    discard_on_fail (default False, requires skip_on_fail_profile) changes
+    what happens AT that same early-exit point: instead of merely stopping
+    (leaving this variation registered in variations.jsonl with whatever
+    partial results it already collected, same as skip-on-fail alone
+    always has), the returned dict carries "discard": True and this
+    variation's name -- a signal for the CALLER to trim_variation() it,
+    deliberately NOT done here. trim_variation() rewrites the whole of
+    variations.jsonl/results.jsonl, which is documented as unsafe to run
+    while another variation elsewhere in the same parallel batch
+    (gen_variations.py's cpu_budget>1 path) is still mid-flight appending
+    to those same two files -- only a caller that knows the whole batch's
+    ThreadPoolExecutor has already finished (ceased ALL concurrent
+    writers) can trim safely. This function itself has no such knowledge
+    (it's one worker among possibly many), so it only ever signals the
+    intent and leaves the actual deletion to gen_variations.py's
+    post-batch cleanup pass (or, for a lone CLI/manual_variation.py call
+    with no batch/executor around it at all, to that script's own main(),
+    which trims immediately since nothing else could be writing
+    concurrently there).
+
+    Returns {"variation": name, "any_error": bool, "discard": bool}
+    ("discard" is always present, False unless this call's own early exit
+    just happened with discard_on_fail=True)."""
     block = block or workspace.BLOCK
     topology = topology or workspace.TOPOLOGY
     name = variation_name(block, topology, params)
@@ -2760,6 +2945,7 @@ def run_variation(block_cfg, tests, defaults, params, force=False, container_ctx
 
     print(f"variation: {name}")
     any_error = False
+    discard = False
 
     # Seeded here (rather than starting empty) so a skip_on_fail_profile
     # constraint referencing an already-fresh/cached test's metric is
@@ -2788,7 +2974,7 @@ def run_variation(block_cfg, tests, defaults, params, force=False, container_ctx
         ], note=" (SKIPPED, fresh result already in sim/results.jsonl)", log_prefix=log_prefix)
 
     if not to_run:
-        return {"variation": name, "any_error": any_error}
+        return {"variation": name, "any_error": any_error, "discard": discard}
 
     # Real work starts here (materialize + simulate) -- see
     # emit_progress_variation_done's own docstring for why elapsed time is
@@ -2836,7 +3022,7 @@ def run_variation(block_cfg, tests, defaults, params, force=False, container_ctx
         except StaleParameterSchema as exc:
             print(f"{log_prefix}{name}: SKIPPED (pre-migration parameter schema, see {exc})")
             emit_progress_variation_done(name, time.monotonic() - start_ts, any_error)
-            return {"variation": name, "any_error": any_error}
+            return {"variation": name, "any_error": any_error, "discard": discard}
 
         git_commit, git_dirty = git_info()
         # A list, not the plain dict-items() iteration this used to be, so a
@@ -2896,6 +3082,7 @@ def run_variation(block_cfg, tests, defaults, params, force=False, container_ctx
                 if skip_on_fail_profile and fom.constraints_violated(
                     profiles.get(skip_on_fail_profile, {}).get("constraints", {}),
                     fom.metrics_to_variables(accumulated_metrics),
+                    max_failures=skip_on_fail_max_failures,
                 ):
                     # Every test from here on was planned into the upfront
                     # emit_progress_total() but will now never run -- same
@@ -2910,11 +3097,16 @@ def run_variation(block_cfg, tests, defaults, params, force=False, container_ctx
                         for _, cfg in to_run_items[i + 1:]
                     )
                     emit_progress_skipped(remaining)
-                    print(f"{log_prefix}  SKIPPING remaining test(s): {test_name} disqualifies profile {skip_on_fail_profile!r} (--skip-on-fail)")
+                    if discard_on_fail:
+                        discard = True
+                        print(f"{log_prefix}  DISCARDING: {test_name} disqualifies profile {skip_on_fail_profile!r} "
+                              f"beyond the {skip_on_fail_max_failures} allowed failure(s) (--discard-on-fail)")
+                    else:
+                        print(f"{log_prefix}  SKIPPING remaining test(s): {test_name} disqualifies profile {skip_on_fail_profile!r} (--skip-on-fail)")
                     break
 
     emit_progress_variation_done(name, time.monotonic() - start_ts, any_error)
-    return {"variation": name, "any_error": any_error}
+    return {"variation": name, "any_error": any_error, "discard": discard}
 
 
 def _variation_params(name):
@@ -2951,6 +3143,34 @@ def validate_skip_on_fail_profile(profile_name):
         )
 
 
+def validate_skip_on_fail_tolerance(profile_name, max_failures, discard, checkpoint_size=None):
+    """sys.exit()s clearly if --skip-on-fail-max-failures/--discard-on-fail
+    are given without a --skip-on-fail profile to apply them to (both are
+    meaningless on their own -- there is no "first fail" to tolerate or
+    discard against without one), or if max_failures is negative. Called
+    alongside validate_skip_on_fail_profile() by every accepting script's
+    main(), same "validate once, up front" precedent.
+
+    checkpoint_size (only gen_variations.py's own --checkpoint-size takes
+    this at all -- run_sim.py/manual_variation.py each only ever run ONE
+    variation, nothing to periodically checkpoint) must be a positive int
+    if given, and requires --discard-on-fail too -- see
+    gen_variations._run_batch()'s own docstring for why it's a silent no-op
+    otherwise (nothing to periodically trim without discard_on_fail); this
+    still refuses it loudly rather than silently ignoring it, same
+    "meaningless combo, say so" precedent as the profile-less checks
+    above."""
+    if max_failures < 0:
+        sys.exit(f"--skip-on-fail-max-failures must be >= 0, got {max_failures}")
+    if profile_name is None and (max_failures > 0 or discard):
+        sys.exit("--skip-on-fail-max-failures/--discard-on-fail require --skip-on-fail PROFILE to also be given")
+    if checkpoint_size is not None:
+        if checkpoint_size < 1:
+            sys.exit(f"--checkpoint-size must be >= 1, got {checkpoint_size}")
+        if not discard:
+            sys.exit("--checkpoint-size requires --discard-on-fail (nothing to periodically trim otherwise)")
+
+
 def main():
     arg_parser = argparse.ArgumentParser(description=__doc__)
     arg_parser.add_argument(
@@ -2970,6 +3190,17 @@ def main():
              "for the active block",
     )
     arg_parser.add_argument(
+        "--skip-on-fail-max-failures", type=int, default=0, metavar="N",
+        help="tolerate up to N already-violated constraints of --skip-on-fail's own PROFILE before actually "
+             "stopping (default 0: any single violation stops it, the original behavior) -- requires --skip-on-fail",
+    )
+    arg_parser.add_argument(
+        "--discard-on-fail", action="store_true",
+        help="when --skip-on-fail (beyond --skip-on-fail-max-failures) actually stops this variation, also "
+             "trim_variation() it (delete its variations.jsonl/results.jsonl rows and sim/<name>/ dir) instead "
+             "of just leaving it registered with whatever partial results it collected -- requires --skip-on-fail",
+    )
+    arg_parser.add_argument(
         "--project-root", default=None,
         help="project folder to operate on (needs a config.json); defaults to the last-opened folder, else CWD",
     )
@@ -2979,6 +3210,7 @@ def main():
 
     workspace.open_folder(args.project_root, block=args.block, topology=args.topology)
     validate_skip_on_fail_profile(args.skip_on_fail)
+    validate_skip_on_fail_tolerance(args.skip_on_fail, args.skip_on_fail_max_failures, args.discard_on_fail)
     config = workspace.CONFIG
     defaults = config["defaults"]
     block_cfg = config["blocks"][workspace.BLOCK]["topologies"][workspace.TOPOLOGY]
@@ -2993,7 +3225,18 @@ def main():
     emit_progress_total(plan_steps(block_cfg, tests, defaults, existing_results, name, args.force))
     historical_durations = historical_test_durations(existing_results, workspace.BLOCK)
     emit_progress_total_seconds(plan_seconds(block_cfg, tests, defaults, existing_results, name, args.force, historical_durations))
-    outcome = run_variation(block_cfg, tests, defaults, params, force=args.force, skip_on_fail_profile=args.skip_on_fail)
+    outcome = run_variation(
+        block_cfg, tests, defaults, params, force=args.force, skip_on_fail_profile=args.skip_on_fail,
+        skip_on_fail_max_failures=args.skip_on_fail_max_failures, discard_on_fail=args.discard_on_fail,
+    )
+    if outcome["discard"]:
+        # Safe to trim immediately: this is a single, standalone
+        # run_variation() call with no batch/executor around it, so no
+        # OTHER concurrent writer could be appending to variations.jsonl/
+        # results.jsonl right now (see run_variation()'s own discard_on_fail
+        # docstring for why this can't be done unconditionally there).
+        trim_variation(outcome["variation"])
+        print(f"{outcome['variation']}: DISCARDED (--discard-on-fail)")
     if outcome["any_error"]:
         sys.exit(1)
 
