@@ -15,7 +15,13 @@ the Profiles list drives the metrics table's PASS/FAIL column, computed
 relative to *that profile's own* constraints (analog_designer.results.fom.constraint_satisfied),
 so the user can see which tests pass/fail for the profile they're looking
 at. A metric that profile doesn't constrain shows a blank pass column, not
-a judgment."""
+a judgment.
+
+Right-clicking a metric or profile row also offers "Declusterize by ..."
+alongside "Sort variations by ..." (same criterion vocabulary, see
+_criterion_sections()) -- opens
+analog_designer.gui.decluster_view.open_decluster_window pre-seeded with
+that criterion, to find and trim near-duplicate parameter-space samples."""
 import tkinter as tk
 from tkinter import ttk
 
@@ -54,7 +60,7 @@ def _format_sig(value, digits=4):
 
 
 class VariationDetail(ttk.Frame):
-    def __init__(self, master, problems_panel=None, on_sort=None, current_sort=None):
+    def __init__(self, master, problems_panel=None, on_sort=None, current_sort=None, on_decluster=None):
         """`problems_panel`: an analog_designer.gui.problems_panel.ProblemsPanel
         instance already built (and placed) elsewhere -- app.py hosts it as
         "Errors"/"Warnings" tabs sharing the same box as its own Console
@@ -68,11 +74,20 @@ class VariationDetail(ttk.Frame):
         VariationsTable.set_criterion for the criterion shape; None clears
         it). `current_sort()` returns the active criterion, so the menus
         only offer "Clear" when there's something to clear. None disables
-        the menus."""
+        the sort section of the menus.
+
+        `on_decluster(criterion, descending)`: called from the SAME
+        right-click menus, a separate section, to open the Declusterize
+        window pre-seeded with that criterion (see
+        analog_designer.gui.decluster_view.open_decluster_window) --
+        `descending` there means "prefer the highest value", the same
+        sense VariationsTable.set_criterion already gives it. None
+        disables the declusterize section."""
         super().__init__(master)
         self.problems_panel = problems_panel
         self._on_sort = on_sort
         self._current_sort = current_sort or (lambda: None)
+        self._on_decluster = on_decluster
         self._variation_name = None
         self._variation_block = None
         self._metrics = []
@@ -258,25 +273,43 @@ class VariationDetail(ttk.Frame):
         if self.problems_panel:
             self.problems_panel.show(self._variation_name, test_name)
 
-    def _popup(self, event, title, entries):
-        """Context menu at the mouse: a disabled `title` line, then
-        (label, criterion, descending) entries that sort the Variations
-        table, then "Clear variation sort" when a sort is active."""
+    def _popup(self, event, sections):
+        """Context menu at the mouse: `sections` is [(header, entries), ...]
+        -- one disabled header line per section (e.g. "Sort variations by
+        X" / "Declusterize by X"), followed by its own (label, criterion,
+        descending) entries routed to `callback`, sections separated by a
+        divider. Ends with "Clear variation sort" when a sort is active
+        (declustering has nothing analogous to clear -- each run is a
+        fresh, standalone window, see decluster_view.py)."""
         menu = tk.Menu(self, tearoff=0)
-        menu.add_command(label=title, state="disabled")
-        menu.add_separator()
-        for label, criterion, descending in entries:
-            menu.add_command(label=label, command=lambda c=criterion, d=descending: self._on_sort(c, d))
-        if self._current_sort() is not None:
+        for header, entries, callback in sections:
+            menu.add_command(label=header, state="disabled")
             menu.add_separator()
+            for label, criterion, descending in entries:
+                menu.add_command(label=label, command=lambda c=criterion, d=descending, cb=callback: cb(c, d))
+            menu.add_separator()
+        if self._current_sort() is not None:
             menu.add_command(label="Clear variation sort", command=lambda: self._on_sort(None, False))
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
             menu.grab_release()
 
+    def _criterion_sections(self, subject, criteria):
+        """(header, entries, callback) for whichever of sort/declusterize
+        this panel was actually wired up with (see __init__) -- both share
+        the exact same `criteria` vocabulary (see variations_table.
+        metric_criteria/profile_criteria), just landing on a different
+        callback, so a menu never offers a choice with nowhere to go."""
+        sections = []
+        if self._on_sort is not None:
+            sections.append((f"Sort variations by {subject}", criteria, self._on_sort))
+        if self._on_decluster is not None:
+            sections.append((f"Declusterize by {subject}", criteria, self._on_decluster))
+        return sections
+
     def _on_metric_menu(self, event):
-        if self._on_sort is None:
+        if self._on_sort is None and self._on_decluster is None:
             return
         item = self.metrics_tree.identify_row(event.y)
         if not item:
@@ -285,26 +318,18 @@ class VariationDetail(ttk.Frame):
         test, metric = self.metrics_tree.set(item, "test"), self.metrics_tree.set(item, "metric")
         row = next((r for r in self._metrics if r["test"] == test and r["metric"] == metric), {})
         fields = ["typical", "min", "max"] + [f for f in ("mean", "std") if row.get(f) is not None]
-        entries = []
-        for field in fields:
-            criterion = {"kind": "metric", "test": test, "metric": metric, "field": field}
-            entries.append((f"{field}, lowest first", criterion, False))
-            entries.append((f"{field}, highest first", criterion, True))
-        self._popup(event, f"Sort variations by {metric}", entries)
+        criteria = variations_table.metric_criteria(test, metric, fields)
+        self._popup(event, self._criterion_sections(metric, criteria))
 
     def _on_profile_menu(self, event):
-        if self._on_sort is None:
+        if self._on_sort is None and self._on_decluster is None:
             return
         item = self.profiles_tree.identify_row(event.y)
         if not item:
             return
         self.profiles_tree.selection_set(item)
-        entries = [
-            ("fom, highest first", {"kind": "profile", "profile": item, "field": "fom"}, True),
-            ("fom, lowest first", {"kind": "profile", "profile": item, "field": "fom"}, False),
-            ("constraints passed, most first", {"kind": "profile", "profile": item, "field": "passed"}, True),
-        ]
-        self._popup(event, f"Sort variations by profile {item}", entries)
+        criteria = variations_table.profile_criteria(item)
+        self._popup(event, self._criterion_sections(f"profile {item}", criteria))
 
     def _render_plot(self, test_name):
         for tab in self.plot_notebook.tabs():

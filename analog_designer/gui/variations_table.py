@@ -58,7 +58,7 @@ def criterion_label(criterion):
     """Heading text for a set_criterion() criterion, without the arrow."""
     if criterion["kind"] == "metric":
         return f"{criterion['metric']} ({criterion['field']})"
-    return f"{criterion['profile']} ({'fom' if criterion['field'] == 'fom' else 'passed'})"
+    return f"{criterion['profile']} ({criterion['field']})"
 
 
 def criterion_value(criterion, s):
@@ -73,10 +73,18 @@ def criterion_value(criterion, s):
     profile = next((p for p in s.get("profiles", []) if p["profile"] == criterion["profile"]), None)
     if profile is None:
         return None, ""
+    fom_value = profile["fom"] if isinstance(profile["fom"], (int, float)) else float("-inf")
     if criterion["field"] == "passed":
         # Ties (many variations at e.g. 6/7) broken by the profile's fom.
-        fom_value = profile["fom"] if isinstance(profile["fom"], (int, float)) else float("-inf")
         return (profile["n_satisfied"], fom_value), f"{profile['n_satisfied']}/{profile['n_constraints']}"
+    if criterion["field"] == "failed":
+        # Only MEASURED out-of-bounds constraints -- a metric with no data
+        # yet (test not run / skipped) isn't a failure. Ties: more passed
+        # first, then higher fom (negated, since fewest failed sorts ascending).
+        text = f"{profile['n_failed']}/{profile['n_constraints']}"
+        if profile["n_missing"]:
+            text += f" ({profile['n_missing']} n/a)"
+        return (profile["n_failed"], -profile["n_satisfied"], -fom_value), text
     if profile["fom_error"]:
         return None, profile["fom_error"]
     value = profile["fom"]
@@ -85,6 +93,34 @@ def criterion_value(criterion, s):
         # renders "N/A" and can't be compared against a float for sorting.
         return None, "" if value is None else fom_module.format_fom(value)
     return value, fom_module.format_fom(value)
+
+
+def metric_criteria(test, metric, fields):
+    """[(label, criterion, descending), ...] -- a "lowest first"/"highest
+    first" pair per field in `fields` (a subset of "typical"/"min"/"max"/
+    "mean"/"std"), for a (test, metric) criterion. Shared by
+    VariationDetail's right-click "Sort variations by"/"Declusterize by"
+    menus (see its own _on_metric_menu) -- both pick from the exact same
+    vocabulary, just route the choice to a different callback."""
+    entries = []
+    for field in fields:
+        criterion = {"kind": "metric", "test": test, "metric": metric, "field": field}
+        entries.append((f"{field}, lowest first", criterion, False))
+        entries.append((f"{field}, highest first", criterion, True))
+    return entries
+
+
+def profile_criteria(profile):
+    """[(label, criterion, descending), ...] for a profile's fom/
+    constraints-passed/constraints-failed -- see metric_criteria()'s own
+    docstring for why this is shared between sorting and declustering."""
+    return [
+        ("fom, highest first", {"kind": "profile", "profile": profile, "field": "fom"}, True),
+        ("fom, lowest first", {"kind": "profile", "profile": profile, "field": "fom"}, False),
+        ("constraints passed, most first", {"kind": "profile", "profile": profile, "field": "passed"}, True),
+        ("constraints failed, fewest first", {"kind": "profile", "profile": profile, "field": "failed"}, False),
+        ("constraints failed, most first", {"kind": "profile", "profile": profile, "field": "failed"}, True),
+    ]
 
 
 def _problems_text(problems):
@@ -193,7 +229,7 @@ class VariationsTable(ttk.Frame):
         the "sort" column -- driven by the detail panel's right-click menus
         (see VariationDetail). criterion is
             {"kind": "metric", "test": ..., "metric": ..., "field": "typical"|"min"|"max"|"mean"|"std"}
-            {"kind": "profile", "profile": ..., "field": "fom"|"passed"}
+            {"kind": "profile", "profile": ..., "field": "fom"|"passed"|"failed"}
         or None to clear it. Kept across reload()s (set_rows re-applies it);
         clicking the "sort" heading flips the direction."""
         self._criterion = criterion

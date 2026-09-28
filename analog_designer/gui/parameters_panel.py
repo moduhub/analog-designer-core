@@ -25,9 +25,15 @@ _UNRESOLVED_VALUE = "—"  # em dash -- a calculated param whose dependency (e.g
 
 
 class ParametersPanel(ttk.Frame):
-    def __init__(self, master, on_vary=None):
+    def __init__(self, master, on_vary=None, on_open_block_ref=None):
         super().__init__(master)
         self.on_vary = on_vary
+        self.on_open_block_ref = on_open_block_ref
+        # row iid -> (block, topology, variation_name) for every block_ref
+        # row currently shown, whose value is a real registered variation
+        # (not "defaults") -- see _render_params/_on_right_click. Rebuilt
+        # from scratch on every show()/clear(), never mutated in place.
+        self._block_refs = {}
 
         params_frame = ttk.LabelFrame(self, text="Parameters")
         params_frame.pack(fill="both", expand=True)
@@ -67,6 +73,7 @@ class ParametersPanel(ttk.Frame):
         # the vary marker -- a click there opens the dialog, it shouldn't
         # also just select the row.
         self.params_tree.bind("<Button-1>", self._on_click)
+        self.params_tree.bind("<Button-3>", self._on_right_click)
 
     def _on_click(self, event):
         if self.on_vary is None:
@@ -81,8 +88,35 @@ class ParametersPanel(ttk.Frame):
         self.on_vary(self.params_tree.set(row, "parameter"))
         return "break"
 
+    def _on_right_click(self, event):
+        """Right-click on a block_ref row (e.g. "top"'s X1_variation/
+        x2_variation) jumps straight to that sub-block variation's own
+        results -- switching Block/Topology and selecting it there -- via
+        on_open_block_ref(block, topology, variation_name), same wiring
+        convention as on_vary. Only offered when this row's current value is
+        a real registered variation: "defaults" (the reserved value meaning
+        "config.json defaults, nothing materialized") has no results to jump
+        to, so it's silently excluded from self._block_refs by
+        _render_params rather than shown here with a dead menu entry."""
+        if self.on_open_block_ref is None:
+            return None
+        row = self.params_tree.identify_row(event.y)
+        ref = self._block_refs.get(row)
+        if ref is None:
+            return None
+        self.params_tree.selection_set(row)
+        block, topology, variation_name = ref
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(
+            label=f"Go to {variation_name} ({block}/{topology})",
+            command=lambda: self.on_open_block_ref(block, topology, variation_name),
+        )
+        menu.tk_popup(event.x_root, event.y_root)
+        return None
+
     def clear(self):
         self.params_tree.delete(*self.params_tree.get_children())
+        self._block_refs = {}
 
     def show(self, variation_name):
         variations = {v["name"]: v for v in data.load_variations(all_topologies=True)}
@@ -109,16 +143,22 @@ class ParametersPanel(ttk.Frame):
         __init__'s _on_click) UNLESS it's a "block_ref" (a sub-block
         variation name, not a number -- no [min,max] range, no slider/sweep
         makes sense) -- analog_designer.gui.vary_param_dialog is scoped to
-        one plain numeric parameter at a time."""
+        one plain numeric parameter at a time. A block_ref row instead gets
+        registered in self._block_refs (see _on_right_click) when its value
+        is a real variation name, not the reserved "defaults"."""
         self.params_tree.delete(*self.params_tree.get_children())
+        self._block_refs = {}
         param_defs = topology_cfg.get("parameters", {})
         for name, value in free_params.items():
             pdef = param_defs.get(name, {})
-            varyable = pdef.get("type") != "block_ref"
-            self.params_tree.insert(
+            is_block_ref = pdef.get("type") == "block_ref"
+            varyable = not is_block_ref
+            row = self.params_tree.insert(
                 "", "end", values=(_VARY_MARKER if varyable else "", "", name, value, pdef.get("description", "")),
                 tags=("varyable",) if varyable else (),
             )
+            if is_block_ref and value != "defaults":
+                self._block_refs[row] = (pdef["block"], pdef["topology"], value)
 
         calc_descriptions = run_sim.calculated_param_descriptions(topology_cfg)
         if not calc_descriptions:

@@ -195,9 +195,14 @@ def classify(block_cfg, metrics):
     block_cfg["profiles"], in config declaration order -- NOT filtered to
     full matches, so callers can see how close an unmatched profile got.
         [{"profile": name, "description": ..., "constraints": {...},
-          "n_satisfied": int, "n_constraints": int, "matched": bool,
+          "n_satisfied": int, "n_failed": int, "n_missing": int,
+          "n_constraints": int, "matched": bool,
           "fom": float|None, "fom_error": str|None}, ...]
-    A missing metric counts as an unsatisfied constraint (not skipped).
+    A missing metric counts as an unsatisfied constraint (not skipped) --
+    but NOT as failed: n_failed counts only constraints whose metric was
+    measured and is out of bounds, n_missing the ones with no data yet
+    (a test not run, or skipped by --skip-on-fail), so
+    n_satisfied + n_failed + n_missing == n_constraints.
     fom is attempted regardless of match status; a formula referencing a
     metric this variation lacks (or that isn't one of this profile's own
     constraints, so has no _min/_max) surfaces as fom_error."""
@@ -210,6 +215,8 @@ def classify(block_cfg, metrics):
             if constraint_satisfied(slug, bounds, base_variables)
         )
         n_constraints = len(constraints)
+        n_missing = sum(1 for slug in constraints if f"{slug}_observed_min" not in base_variables)
+        n_failed = n_constraints - n_satisfied - n_missing
 
         variables = dict(base_variables)
         for slug, bounds in constraints.items():
@@ -231,6 +238,8 @@ def classify(block_cfg, metrics):
             "description": profile.get("description", ""),
             "constraints": constraints,
             "n_satisfied": n_satisfied,
+            "n_failed": n_failed,
+            "n_missing": n_missing,
             "n_constraints": n_constraints,
             "matched": n_satisfied == n_constraints,
             "fom": fom,

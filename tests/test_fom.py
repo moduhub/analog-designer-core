@@ -111,6 +111,18 @@ class ClassifyTests(unittest.TestCase):
         self.assertFalse(results[0]["matched"])
         self.assertEqual(results[0]["n_satisfied"], 0)
 
+    def test_missing_metric_is_not_satisfied_but_not_failed_either(self):
+        """A test not run yet (or skipped by --skip-on-fail) leaves its
+        metric absent: it can't count as passed, but it isn't a measured
+        failure -- n_failed counts only out-of-bounds measurements."""
+        block_cfg = {"profiles": {"demo": {"constraints": {
+            "current": {"maximum": 1.0}, "psrr": {"minimum": 50.0}, "noise": {"maximum": 1.0},
+        }}}}
+        metrics = [_metric("current", 0.5, 0.4, 0.6), _metric("psrr", 45.0, 40.0, 48.0)]
+        result = classify(block_cfg, metrics)[0]
+        self.assertEqual((result["n_satisfied"], result["n_failed"], result["n_missing"]), (1, 1, 1))
+        self.assertEqual(result["n_constraints"], 3)
+
 
 class ConstraintsViolatedTests(unittest.TestCase):
     """max_failures's own tolerance (default 0 == the original "any single

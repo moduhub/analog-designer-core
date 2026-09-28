@@ -32,8 +32,8 @@ import argparse
 import sys
 
 from analog_designer.core import workspace
-from analog_designer.sim.gen_variations import _run_batch
-from analog_designer.sim.run_sim import _read_jsonl, validate_skip_on_fail_profile
+from analog_designer.sim.gen_variations import _run_batch, add_skip_on_fail_tolerance_args, skip_on_fail_batch_kwargs
+from analog_designer.sim.run_sim import _read_jsonl, validate_skip_on_fail_profile, validate_skip_on_fail_tolerance
 
 
 def select_variations(name_from, name_to):
@@ -109,6 +109,7 @@ def main():
         help="stop simulating a variation's remaining tests the moment they'd already disqualify PROFILE "
              "(a config.json blocks.<block>.profiles name) -- opt-in, off by default",
     )
+    add_skip_on_fail_tolerance_args(parser, allow_discard=False)
     parser.add_argument("--project-root", default=None, help="project folder to operate on; defaults to the last-opened folder, else CWD")
     parser.add_argument("--block", default=None, help="block to operate on; defaults to the first declared in config.json")
     parser.add_argument("--topology", default=None, help="topology to operate on; defaults to the first declared for --block")
@@ -116,6 +117,9 @@ def main():
 
     workspace.open_folder(args.project_root, block=args.block, topology=args.topology)
     validate_skip_on_fail_profile(args.skip_on_fail)
+    validate_skip_on_fail_tolerance(
+        args.skip_on_fail, args.skip_on_fail_max_failures, args.discard_on_fail, args.checkpoint_size,
+    )
     config = workspace.CONFIG
     defaults = config["defaults"]
     block_cfg = config["blocks"][workspace.BLOCK]["topologies"][workspace.TOPOLOGY]
@@ -136,7 +140,7 @@ def main():
     else:
         print(f"updating {len(selected)} variation(s): {selected[0]['name']} .. {selected[-1]['name']}")
     param_sets = [row["parameters"] for row in selected]
-    any_error = _run_batch(param_sets, block_cfg, tests, defaults, args.force, origin=None, skip_on_fail_profile=args.skip_on_fail)
+    any_error = _run_batch(param_sets, block_cfg, tests, defaults, args.force, origin=None, **skip_on_fail_batch_kwargs(args))
 
     sys.exit(1 if any_error else 0)
 

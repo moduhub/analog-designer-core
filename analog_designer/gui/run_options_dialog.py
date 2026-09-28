@@ -60,14 +60,16 @@ def resolve_skip_profile(profile_var):
     return None if chosen == _OFF else chosen
 
 
-def add_skip_fail_tolerance_fields(parent, max_failures, discard_on_fail, row=2):
+def add_skip_fail_tolerance_fields(parent, max_failures, discard_on_fail, row=2, allow_discard=True):
     """Grids the two tolerance knobs for whichever --skip-on-fail profile
     add_force_skip_fields() already put in `parent` -- a SEPARATE function
     (not folded into add_force_skip_fields() itself) so every dialog that
     already embeds that one keeps working completely unchanged; only a
     caller that actually wants these (today: create_variation_dialog's own
     Monte Carlo-generating "Create variation" dialog -- the search
-    workflow these tolerances exist for) calls this too, right after it,
+    workflow these tolerances exist for, and now every other job-launching
+    dialog too: Update's ask_run_confirm, pro's Generate/Auto Combine/Vary)
+    calls this too, right after it,
     into the SAME options area. `row` defaults to 2 -- right below
     add_force_skip_fields()'s own force/skip-profile rows (0 and 1) when
     both are called back to back starting at the SAME row=0.
@@ -77,13 +79,18 @@ def add_skip_fail_tolerance_fields(parent, max_failures, discard_on_fail, row=2)
     at OK time already resets an unpaired value to (0, False) rather than
     trusting whatever the widgets still show, mirroring run_sim.
     validate_skip_on_fail_tolerance()'s own CLI-side requirement. Returns
-    (max_failures_var, discard_var)."""
+    (max_failures_var, discard_var); discard_var is None with
+    allow_discard=False -- Update's ask_run_confirm, where every variation
+    already exists and discarding would delete earlier work, not just a
+    candidate this job generated."""
     ttk.Label(parent, text="Tolerance:").grid(row=row, column=0, sticky="w", padx=(0, 6), pady=(4, 0))
     tolerance_row = ttk.Frame(parent)
     tolerance_row.grid(row=row, column=1, columnspan=2, sticky="w", pady=(4, 0))
     max_failures_var = tk.IntVar(value=max_failures)
     ttk.Spinbox(tolerance_row, from_=0, to=99, textvariable=max_failures_var, width=4).pack(side="left")
     ttk.Label(tolerance_row, text="failed constraint(s) allowed before stopping").pack(side="left", padx=(4, 0))
+    if not allow_discard:
+        return max_failures_var, None
     discard_var = tk.BooleanVar(value=discard_on_fail)
     ttk.Checkbutton(
         parent, text="Discard the variation entirely once exceeded (instead of just skipping the rest of its tests)",
@@ -103,15 +110,22 @@ def resolve_skip_fail_tolerance(profile_var, max_failures_var, discard_var):
     over a stale widget value the person never touched this time."""
     if resolve_skip_profile(profile_var) is None:
         return 0, False
-    return max_failures_var.get(), discard_var.get()
+    return max_failures_var.get(), (discard_var.get() if discard_var is not None else False)
 
 
-def ask_run_confirm(parent, title, message, config, force, skip_on_fail_profile, skip_on_fail=True):
+def ask_run_confirm(parent, title, message, config, force, skip_on_fail_profile, skip_on_fail=True,
+                    skip_on_fail_max_failures=0, discard_on_fail=False):
+    # discard_on_fail is accepted (App._run_option_kwargs() passes it to
+    # every dialog) but never shown -- see the docstring below.
     """Small confirmation Toplevel for a job-launching action with no
     dialog of its own (Update, Train) -- shows `message` plus the same
-    force/skip fields every other action's dialog embeds, pre-filled with
-    the last-used values. {"force": bool, "skip_on_fail_profile": str|None}
-    or None if cancelled, same convention as every ask_*() in this package."""
+    force/skip fields every other action's dialog embeds (and, unless
+    skip_on_fail=False, the tolerance field too -- never discard: these
+    actions run on variations that already exist), pre-filled with the
+    last-used values. {"force": bool, "skip_on_fail_profile": str|None,
+    "skip_on_fail_max_failures": int} or None if cancelled, same
+    convention as every ask_*() in this package. No "discard_on_fail" key,
+    so App._apply_run_options() keeps the last Create/Generate choice."""
     result = {}
     win = tk.Toplevel(parent)
     win.title(title)
@@ -127,16 +141,26 @@ def ask_run_confirm(parent, title, message, config, force, skip_on_fail_profile,
     force_var, profile_var = add_force_skip_fields(
         body, config, force, skip_on_fail_profile, row=1, skip_on_fail=skip_on_fail,
     )
+    max_failures_var = (
+        add_skip_fail_tolerance_fields(body, skip_on_fail_max_failures, False, row=3, allow_discard=False)[0]
+        if skip_on_fail else None
+    )
 
     def on_ok():
-        result["value"] = {"force": force_var.get(), "skip_on_fail_profile": resolve_skip_profile(profile_var)}
+        max_failures = (
+            resolve_skip_fail_tolerance(profile_var, max_failures_var, None)[0] if max_failures_var else 0
+        )
+        result["value"] = {
+            "force": force_var.get(), "skip_on_fail_profile": resolve_skip_profile(profile_var),
+            "skip_on_fail_max_failures": max_failures,
+        }
         win.destroy()
 
     def on_cancel():
         win.destroy()
 
     buttons = ttk.Frame(body)
-    buttons.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+    buttons.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(12, 0))
     ttk.Button(buttons, text="Cancel", command=on_cancel).pack(side="right")
     ttk.Button(buttons, text="OK", command=on_ok).pack(side="right", padx=(0, 8))
 

@@ -76,6 +76,7 @@ from analog_designer.core import workspace
 from analog_designer.release import export as release_export
 from analog_designer.results import data
 from analog_designer.sim import run_sim
+from analog_designer.gui import decluster_view
 from analog_designer.gui.create_variation_dialog import ask_create_variation
 from analog_designer.gui.docker_settings_dialog import show_docker_settings
 from analog_designer.gui.parameters_panel import ParametersPanel
@@ -161,6 +162,10 @@ class App(ttk.Frame):
         # look at once the whole batch is done.
         self._last_run_status = {}
 
+        # Singleton Toplevel, same convention as pro's own
+        # _inductor_generator_popup -- see _open_decluster_window().
+        self._decluster_window = None
+
         self._build_menu()
         self._build_context_bar()
         self._build_progress_bar()
@@ -203,6 +208,7 @@ class App(ttk.Frame):
         variation_menu.add_command(label="Create...", command=self._create_variation)
         variation_menu.add_separator()
         variation_menu.add_command(label="Trim", command=self._trim_selected)
+        variation_menu.add_command(label="Declusterize...", command=self._open_decluster_window)
         menubar.add_cascade(label="Variation", menu=variation_menu)
 
         run_menu = tk.Menu(menubar, tearoff=False)
@@ -339,13 +345,17 @@ class App(ttk.Frame):
         # by analog_designer_pro.gui.vary_param_dialog -- a pro subclass
         # would need to build its own ParametersPanel with on_vary wired in
         # if it wants this row-level "vary just this parameter" action).
-        self.params_panel = ParametersPanel(left, on_vary=None)
+        # on_open_block_ref IS wired here (not PRO-only): right-clicking a
+        # block_ref row (e.g. "top"'s X1_variation) jumps to that sub-block
+        # variation's own results -- see _open_block_ref.
+        self.params_panel = ParametersPanel(left, on_vary=None, on_open_block_ref=self._open_block_ref)
         left.add(self.table, weight=2)
         left.add(self.params_panel, weight=1)
 
         self.detail = VariationDetail(
             paned, problems_panel=self.problems_panel,
             on_sort=self.table.set_criterion, current_sort=lambda: self.table.criterion,
+            on_decluster=self._open_decluster_window,
         )
         paned.add(left, weight=1)
         paned.add(self.detail, weight=2)
@@ -484,11 +494,43 @@ class App(ttk.Frame):
         self.detail.show(variation_name)
         self.params_panel.show(variation_name)
 
+    def _open_block_ref(self, block, topology, variation_name):
+        """ParametersPanel's on_open_block_ref: right-clicking a block_ref
+        row (e.g. "top"'s X1_variation) jumps straight to that sub-block
+        variation's own results, instead of a manual Block/Topology switch +
+        scroll-to-find in the table. Guarded on self.trigger.running like
+        every other context switch (_on_block_selected/_on_topology_selected)
+        -- switching mid-job would yank the table out from under whatever
+        background job is currently populating it.
+
+        Switches first, THEN checks the target variation is still registered
+        -- data.load_variations() is always scoped to the CURRENT
+        workspace.BLOCK/TOPOLOGY (see data._filter_scope), so there's no way
+        to check a DIFFERENT block's registry without switching to it first.
+        If it turns out to be gone (trimmed since this row was rendered),
+        the user is left on that block/topology anyway, which is still a
+        reasonable place to be -- just nothing gets selected."""
+        if self.trigger.running:
+            return
+        if (block, topology) != (workspace.BLOCK, workspace.TOPOLOGY):
+            self._apply_block_topology(block, topology)
+        if not any(v["name"] == variation_name for v in data.load_variations()):
+            messagebox.showerror(
+                "Go to variation",
+                f"{variation_name!r} is no longer a registered {block}/{topology} variation.",
+            )
+            return
+        self.selected_variation = variation_name
+        self.table.select_variation(variation_name)
+        self.detail.show(variation_name)
+        self.params_panel.show(variation_name)
+
     def _set_busy(self, busy):
         state = "disabled" if busy else "normal"
         self._menus["run"].entryconfig("Update", state=state)
         self._menus["variation"].entryconfig("Create...", state=state)
         self._menus["variation"].entryconfig("Trim", state=state)
+        self._menus["variation"].entryconfig("Declusterize...", state=state)
         self._menus["data"].entryconfig("Release...", state=state)
         self._menus["data"].entryconfig("Purge Stale Results...", state=state)
         self._menus["data"].entryconfig("Purge Plots...", state=state)
@@ -553,10 +595,13 @@ class App(ttk.Frame):
             message = f"Update {len(names)} selected variation(s)?"
         else:
             message = f"Update {self.selected_variation or 'the default variation'}?"
-        result = ask_run_confirm(self, "Update", message, data.load_config(), self._run_force, self._skip_on_fail_profile)
+        result = ask_run_confirm(
+            self, "Update", message, data.load_config(), self._run_force, self._skip_on_fail_profile,
+            **self._run_option_kwargs(),
+        )
         if result is None:
             return
-        self._run_force, self._skip_on_fail_profile = result["force"], result["skip_on_fail_profile"]
+        self._apply_run_options(result)
 
         if len(names) >= 2:
             argv = [sys.executable, "-m", "analog_designer.sim.update_variations"]
@@ -572,33 +617,50 @@ class App(ttk.Frame):
             scope_args = self._scope_args(topology=self._topology_of(self.selected_variation))
             status = f"updating {self.selected_variation or 'default variation'}..."
             job = "update"
-        if self._run_force:
-            argv.append("--force")
-        if self._skip_on_fail_profile:
-            argv += ["--skip-on-fail", self._skip_on_fail_profile]
+        argv += self._run_option_argv(allow_discard=False)
         argv += scope_args
         self._start_job(job, argv, status)
 
     def _trim_selected(self):
-        """Deletes one or more variations entirely (variations.jsonl/
-        results.jsonl rows + sim/<name>/ dir) -- same Shift/Ctrl-click range
-        selection as _start_update()'s own VariationsTable.selected_variations()
-        (a Monte Carlo batch's worth of bad candidates at once, not just
-        whichever single row happens to be the "selected" one for the
-        detail/params panels)."""
+        """Deletes one or more variations entirely -- same Shift/Ctrl-click
+        range selection as _start_update()'s own VariationsTable.
+        selected_variations() (a Monte Carlo batch's worth of bad
+        candidates at once, not just whichever single row happens to be
+        the "selected" one for the detail/params panels). See
+        _trim_names() for the actual delete/confirm/refresh -- shared with
+        analog_designer.gui.decluster_view's own "Trim selected
+        candidate(s)" button, which sources its own name list from a
+        cluster's candidates instead of the table's selection."""
         if self.trigger.running:
             return
         names = self.table.selected_variations()
         if not names:
             messagebox.showinfo("Trim", "Select one or more variations first.")
             return
+        self._trim_names(names, noun="variation(s)")
+
+    def _trim_names(self, names, noun="candidate(s)"):
+        """Confirms, then deletes every one of `names` entirely
+        (variations.jsonl/results.jsonl rows + sim/<name>/ dir), clears the
+        detail/params panels if the currently-shown variation was among
+        them, and reloads the table. Returns True if it actually trimmed
+        anything (False for an empty list or a cancelled confirmation) --
+        decluster_view.DeclusterWindow uses this to know whether to drop
+        the trimmed rows from its own results list. Callers (here, and
+        that window) are responsible for their own self.trigger.running
+        guard -- trim_variation() itself must not run concurrently with a
+        docker-backed writer (see its own docstring), and a long-open
+        Declusterize window can easily still be sitting there once a NEW
+        job has since started."""
+        if not names:
+            return False
         message = (
             f"Delete {names[0]} and all its simulation data? This cannot be undone."
             if len(names) == 1 else
-            f"Delete {len(names)} selected variations and all their simulation data? This cannot be undone."
+            f"Delete {len(names)} selected {noun} and all their simulation data? This cannot be undone."
         )
         if not messagebox.askyesno("Trim variation(s)", message):
-            return
+            return False
         for name in names:
             run_sim.trim_variation(name)
         if self.selected_variation in names:
@@ -607,6 +669,28 @@ class App(ttk.Frame):
             self.params_panel.clear()
         self.status_var.set(f"trimmed {len(names)} variation(s)" if len(names) > 1 else f"trimmed {names[0]}")
         self.reload()
+        return True
+
+    def _open_decluster_window(self, criterion=None, descending=True):
+        """Opens (or re-focuses an already-open) the Declusterize window --
+        see analog_designer.gui.decluster_view.DeclusterWindow. A
+        singleton, same convention as pro's own
+        _open_inductor_generator_popup: repeated invocations re-focus the
+        same window instead of stacking duplicates. `criterion`/
+        `descending` (from VariationDetail's "Declusterize by ..." context
+        menus, see its own on_decluster) re-seed an already-open window's
+        metric choice too -- but only when one was actually given: the
+        plain "Variation > Declusterize..." menu entry calls this with
+        criterion=None just to (re)focus the window, and must never reset
+        whatever metric the user already had it running with."""
+        if self._decluster_window is not None and self._decluster_window.winfo_exists():
+            if criterion is not None:
+                self._decluster_window.set_criterion(criterion, descending)
+            self._decluster_window.deiconify()
+            self._decluster_window.lift()
+            self._decluster_window.focus_force()
+            return
+        self._decluster_window = decluster_view.DeclusterWindow(self, criterion, descending)
 
     def _purge_stale_selected(self):
         """Data menu action: physically deletes results.jsonl rows (and
@@ -716,6 +800,40 @@ class App(ttk.Frame):
             f"release/xschem/sch/ and release/doc/{result['block']}/.",
         )
 
+    def _run_option_kwargs(self):
+        """The last-used run options, as the keyword arguments every
+        job-launching dialog (ask_run_confirm, ask_create_variation, pro's
+        own dialogs) takes to pre-fill its force/skip/tolerance fields."""
+        return {
+            "skip_on_fail_max_failures": self._skip_on_fail_max_failures,
+            "discard_on_fail": self._discard_on_fail,
+        }
+
+    def _apply_run_options(self, result):
+        """Remember whatever a job-launching dialog returned as the new
+        last-used run options (see _run_option_kwargs/_run_option_argv)."""
+        self._run_force, self._skip_on_fail_profile = result["force"], result["skip_on_fail_profile"]
+        self._skip_on_fail_max_failures = result.get("skip_on_fail_max_failures", 0)
+        # Update's dialog has no discard field (see ask_run_confirm) -- keep
+        # the last Create/Generate choice instead of resetting it.
+        self._discard_on_fail = result.get("discard_on_fail", self._discard_on_fail)
+
+    def _run_option_argv(self, allow_discard=True):
+        """--force / --skip-on-fail / --skip-on-fail-max-failures /
+        --discard-on-fail for the current run options. allow_discard=False
+        for Update: its variations already exist, so a disqualifying
+        profile must never delete them (update_variations doesn't even
+        accept --discard-on-fail; run_sim's CLI still does, for scripted
+        use, but the GUI never passes it)."""
+        argv = ["--force"] if self._run_force else []
+        if self._skip_on_fail_profile:
+            argv += ["--skip-on-fail", self._skip_on_fail_profile]
+            if self._skip_on_fail_max_failures:
+                argv += ["--skip-on-fail-max-failures", str(self._skip_on_fail_max_failures)]
+            if self._discard_on_fail and allow_discard:
+                argv.append("--discard-on-fail")
+        return argv
+
     def _create_variation(self, initial_tab="basic"):
         if self.trigger.running:
             return
@@ -724,23 +842,13 @@ class App(ttk.Frame):
         result = ask_create_variation(
             self, config, workspace.BLOCK, workspace.TOPOLOGY, data.load_variations(), param_defs,
             self._run_force, self._skip_on_fail_profile, initial_tab=initial_tab,
-            default_parent=self.selected_variation,
-            skip_on_fail_max_failures=self._skip_on_fail_max_failures, discard_on_fail=self._discard_on_fail,
+            default_parent=self.selected_variation, **self._run_option_kwargs(),
         )
         if result is None:
             return
-        self._run_force, self._skip_on_fail_profile = result["force"], result["skip_on_fail_profile"]
-        self._skip_on_fail_max_failures = result["skip_on_fail_max_failures"]
-        self._discard_on_fail = result["discard_on_fail"]
+        self._apply_run_options(result)
         argv, status = self._create_argv(result)
-        if self._run_force:
-            argv.append("--force")
-        if self._skip_on_fail_profile:
-            argv += ["--skip-on-fail", self._skip_on_fail_profile]
-            if self._skip_on_fail_max_failures:
-                argv += ["--skip-on-fail-max-failures", str(self._skip_on_fail_max_failures)]
-            if self._discard_on_fail:
-                argv.append("--discard-on-fail")
+        argv += self._run_option_argv()
         argv += self._scope_args()
         self._start_job("create", argv, status)
 

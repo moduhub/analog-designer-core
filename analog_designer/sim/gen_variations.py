@@ -121,6 +121,48 @@ def random_params(param_defs, rng, spread_pct=None):
 DEFAULT_CHECKPOINT_MULTIPLIER = 3
 
 
+def add_skip_on_fail_tolerance_args(parser, allow_discard=True):
+    """--skip-on-fail-max-failures (+ --discard-on-fail / --checkpoint-size
+    unless allow_discard=False), for every batch script built on
+    _run_batch() (this one, update_variations, pro's genetic_variation) --
+    validate them with run_sim.validate_skip_on_fail_tolerance() and
+    forward them with skip_on_fail_batch_kwargs(). allow_discard=False for
+    update_variations: it re-runs variations that already exist, and
+    discarding one would delete earlier work, not a fresh candidate."""
+    parser.add_argument(
+        "--skip-on-fail-max-failures", type=int, default=0, metavar="N",
+        help="tolerate up to N already-violated constraints of --skip-on-fail's own PROFILE before actually "
+             "stopping (default 0: any single violation stops it) -- requires --skip-on-fail",
+    )
+    if not allow_discard:
+        parser.set_defaults(discard_on_fail=False, checkpoint_size=None)
+        return
+    parser.add_argument(
+        "--discard-on-fail", action="store_true",
+        help="when --skip-on-fail (beyond --skip-on-fail-max-failures) actually stops a variation, trim it "
+             "entirely (and, for a hierarchical block, its own freshly-generated sub-block variations too) "
+             "instead of leaving it registered with partial results -- requires --skip-on-fail",
+    )
+    parser.add_argument(
+        "--checkpoint-size", type=int, default=None, metavar="N",
+        help="with --discard-on-fail, trim discarded variations every N samples instead of waiting for the "
+             f"whole batch to finish -- keeps disk usage bounded on a long, low-hit-rate search. Auto-sizes to "
+             f"{DEFAULT_CHECKPOINT_MULTIPLIER} * the container.cpu_budget setting when --discard-on-fail is on "
+             "and this is left unset; pass an explicit N to override. Requires --discard-on-fail",
+    )
+
+
+def skip_on_fail_batch_kwargs(args):
+    """_run_batch() keyword arguments from a parser that went through
+    add_skip_on_fail_tolerance_args() (plus its own --skip-on-fail)."""
+    return {
+        "skip_on_fail_profile": args.skip_on_fail,
+        "skip_on_fail_max_failures": args.skip_on_fail_max_failures,
+        "discard_on_fail": args.discard_on_fail,
+        "checkpoint_size": args.checkpoint_size,
+    }
+
+
 def _trim_all(names):
     """trim_variation() each of `names` -> (trimmed, failed). A trim that
     still fails after run_sim._replace_with_retry()'s own retries (a file
@@ -603,24 +645,7 @@ def main():
         help="stop simulating a variation's remaining tests the moment they'd already disqualify PROFILE "
              "(a config.json blocks.<block>.profiles name) -- opt-in, off by default",
     )
-    parser.add_argument(
-        "--skip-on-fail-max-failures", type=int, default=0, metavar="N",
-        help="tolerate up to N already-violated constraints of --skip-on-fail's own PROFILE before actually "
-             "stopping (default 0: any single violation stops it) -- requires --skip-on-fail",
-    )
-    parser.add_argument(
-        "--discard-on-fail", action="store_true",
-        help="when --skip-on-fail (beyond --skip-on-fail-max-failures) actually stops a variation, trim it "
-             "entirely (and, for a hierarchical block, its own freshly-generated sub-block variations too) "
-             "instead of leaving it registered with partial results -- requires --skip-on-fail",
-    )
-    parser.add_argument(
-        "--checkpoint-size", type=int, default=None, metavar="N",
-        help="with --discard-on-fail, trim discarded variations every N samples instead of waiting for the "
-             f"whole batch to finish -- keeps disk usage bounded on a long, low-hit-rate search. Auto-sizes to "
-             f"{DEFAULT_CHECKPOINT_MULTIPLIER} * the container.cpu_budget setting when --discard-on-fail is on "
-             "and this is left unset; pass an explicit N to override. Requires --discard-on-fail",
-    )
+    add_skip_on_fail_tolerance_args(parser)
     parser.add_argument("--seed", type=int, default=None, help="random seed, for reproducible batches")
     parser.add_argument("--project-root", default=None, help="project folder to operate on; defaults to the last-opened folder, else CWD")
     parser.add_argument("--block", default=None, help="block to operate on; defaults to the first declared in config.json")
