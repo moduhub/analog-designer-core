@@ -81,16 +81,17 @@ def run_extracted(block_cfg, params, test_name, variation=None):
             "error": f"run_extracted only supports ngspice testbenches so far (this test declares {simulator!r})",
         }
 
-    layout_target = variation or topology
-    layout_dir = workspace.PROJECT_ROOT / "layout" / block / layout_target
-    extracted_path = layout_dir / f"{block}_extracted.spice"
-    if not extracted_path.exists():
-        return {"status": "error", "error": f"no {extracted_path.name} -- run Extract + LVS for this variation first"}
-    extracted_text = extracted_path.read_text(encoding="utf-8")
-
     defaults = workspace.CONFIG["defaults"]
     name = variation_name(block, topology, params)
     sim_dir = workspace.PROJECT_ROOT / "sim" / name
+    # analog_designer_pro.layout.magic_layout.stage_extract's own output --
+    # the FULL parasitic netlist, gated there on a clean LVS -- not
+    # stage_lvs's own connectivity-only <block>_extracted_lvs.spice.
+    extracted_path = sim_dir / "layout_verify" / f"{block}_extracted.spice"
+    if not extracted_path.exists():
+        return {"status": "error", "error": f"no {extracted_path.name} -- run LVS then Extract for this variation first"}
+    extracted_text = extracted_path.read_text(encoding="utf-8")
+
     verify_dir = sim_dir / "layout_verify" / test_name
     verify_dir.mkdir(parents=True, exist_ok=True)
 
