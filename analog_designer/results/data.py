@@ -252,6 +252,17 @@ def variation_summaries(all_topologies=False, names=None):
                 for r in rows
             },
             "has_stale": any(r.get("stale") for r in rows),
+            # A .mag file actually sitting in layout/<block>/<variation>/ --
+            # not just layout_spec.json, which pro's gen_spec.py regenerates
+            # unconditionally as spec INPUT and says nothing about whether
+            # Magic has ever drawn anything from it yet (see
+            # analog_designer_pro.layout.magic_layout's own docstring: Magic
+            # itself owns this folder's actual layout state). A cheap glob,
+            # not a pro-specific import -- this stays meaningful (and False)
+            # for a project with no pro layout tooling at all.
+            "has_layout": any(
+                (workspace.PROJECT_ROOT / "layout" / variation["block"] / variation["name"]).glob("*.mag")
+            ),
             "problems": variation_problem_counts(variation["name"]),
             "created": variation["created"],
         })

@@ -30,6 +30,16 @@ COLUMNS = ("variation", "sort", "status", "stale", "problems", "block", "topolog
 # count) sourced from analog_designer.results.data.variation_problem_counts
 # -- e.g. "!1" for 5 identical ngspice warnings that all group into one
 # distinct diagnostic key. Blank when the variation has none.
+# "stale" (internal column key, kept for COLUMNS/NUMERIC_COLUMNS/tag-name
+# stability -- only its HEADING text changed, to "flags") carries two
+# independent, deliberately opposite-valence glyphs now, not just staleness
+# (see _markers_text): "⏰" for has_stale (something to go fix) and "▦" for
+# has_layout (a neutral/positive fact -- this variation's own
+# layout/<block>/<variation>/ already has a real Magic .mag cell, not just
+# an auto-regenerated layout_spec.json), deliberately not sharing one
+# ambiguous "*" between a negative and a positive signal. Reuses this
+# column rather than adding a dedicated "layout" one, same reasoning as
+# "status" above; "⏰▦" when both apply.
 # "status" is a live, per-row readout of a batch job's own progress for that
 # variation ("⏳ <test> Ns" while in flight -- the current test's own name,
 # not just an elapsed counter, so a reader can tell WHAT a slow row is stuck
@@ -123,6 +133,27 @@ def profile_criteria(profile):
     ]
 
 
+def _markers_text(s):
+    """Two independent, deliberately opposite-valence glyphs for the
+    "flags" column (renamed from "stale" now that it carries both): "⏰"
+    (a warning-colored clock, not a plain "*") when any measured metric is
+    stale (has_stale) -- this one flags something to go fix -- and "▦" when
+    this variation has a Magic layout drawn (has_layout --
+    layout/<block>/<variation>/ holds at least one real .mag file, see
+    analog_designer.results.data.variation_summaries's own comment on that
+    check) -- a neutral/positive fact, not a problem, so it reads visually
+    distinct from the stale clock rather than sharing one ambiguous "*".
+    Reuses this narrow marker column instead of adding a dedicated "layout"
+    one -- same reasoning _problems_text's own glyph-column reuse already
+    follows, see this module's own docstring."""
+    parts = []
+    if s.get("has_stale"):
+        parts.append("⏰")
+    if s.get("has_layout"):
+        parts.append("▦")
+    return "".join(parts)
+
+
 def _problems_text(problems):
     """"✗2 !5" for 2 distinct errors + 5 distinct warnings, "✗2" / "!5" when
     only one severity is present, "" when problems is falsy (no runs.jsonl
@@ -163,7 +194,8 @@ class VariationsTable(ttk.Frame):
         self.tree.heading("sort", text=SORT_HEADING)
         self.tree.column("sort", width=190, anchor="e")
         self.tree.column("status", width=170, anchor="w")  # room for "⏳ <test> Ns", not just "Ns" -- a first guess, easy to retune
-        self.tree.column("stale", width=40, anchor="center")
+        self.tree.heading("stale", text="flags")  # carries both markers now, see _markers_text's own docstring
+        self.tree.column("stale", width=50, anchor="center")
         self.tree.column("problems", width=60, anchor="center")
 
         vsb = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
@@ -213,7 +245,7 @@ class VariationsTable(ttk.Frame):
         full reload() would have produced for the same summary."""
         sort_value, sort_text = criterion_value(self._criterion, s) if self._criterion else (None, "")
         values = (
-            s["variation"], sort_text, "", "*" if s.get("has_stale") else "", _problems_text(s.get("problems")),
+            s["variation"], sort_text, "", _markers_text(s), _problems_text(s.get("problems")),
             s["block"], s["topology"], s["n_total"], s["created"],
         )
         tags = ("stale",) if s.get("has_stale") else ()
