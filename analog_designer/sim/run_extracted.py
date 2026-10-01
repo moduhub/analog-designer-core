@@ -39,6 +39,7 @@ from analog_designer.sim.run_sim import (
 )
 
 _SUBCKT_RE_TEMPLATE = r'^\.subckt\s+{block}\b.*?^\.ends\b[^\n]*\n?'
+_SUBCKT_HEADER_RE = re.compile(r'^\.subckt\s+(\S+)\s*([^\n]*)\n', re.IGNORECASE | re.MULTILINE)
 
 
 def _splice_extracted_subckt(netlist_text, block, extracted_text):
@@ -52,15 +53,24 @@ def _splice_extracted_subckt(netlist_text, block, extracted_text):
     .subckt/.ends pairs), so a non-greedy match up to the very next .ends
     is always this subckt's own closing line, not some other block's.
 
-    Does NOT verify pin name/order agreement between the two subckts
-    beyond both matching `block`'s own name -- a clean Extract+LVS run
-    confirms DEVICE connectivity matches, not that ext2spice emitted its
-    .subckt header's port list in the same order the schematic-derived one
-    uses. ngspice matches subckt ports positionally, so a real order
-    mismatch here would silently simulate a mis-wired circuit rather than
-    erroring -- verify this against a real extracted netlist for this PDK
-    before trusting results from this function, per this feature's own
-    implementation plan."""
+    Verifies pin agreement between the two subckts beyond both matching
+    `block`'s own name: a clean Extract+LVS run confirms DEVICE
+    connectivity matches, not that ext2spice emitted its .subckt header's
+    port list in the same ORDER the schematic-derived one uses. ngspice
+    matches subckt ports positionally, so a real order mismatch here would
+    silently simulate a mis-wired circuit rather than erroring -- confirmed
+    live 2026-10-01 against a real ihp-sg13cmos5l extraction for output_amp
+    that this does happen (extracted ".subckt output_amp vo vdd vss ibias
+    vp vn" vs. schematic ".subckt output_amp vdd vo vp vn ibias vss", same
+    6 ports, genuinely different order -- ext2spice's own port ordering
+    comes from Magic's internal port/label bookkeeping, not the schematic
+    symbol's declared pin order). If the two port lists are the same SET
+    of names but a different order, only the extracted header's own port
+    list is rewritten to match the schematic's order before splicing --
+    the body's internal connectivity references nodes by name, not
+    position, so it's unaffected. A different SET of names (not just a
+    reorder) is a real mismatch, not something to paper over, so that
+    raises instead."""
     pattern = re.compile(_SUBCKT_RE_TEMPLATE.format(block=re.escape(block)), re.IGNORECASE | re.MULTILINE | re.DOTALL)
     dut_match = pattern.search(netlist_text)
     if dut_match is None:
@@ -68,7 +78,23 @@ def _splice_extracted_subckt(netlist_text, block, extracted_text):
     extracted_match = pattern.search(extracted_text)
     if extracted_match is None:
         raise ValueError(f"extracted netlist has no .subckt {block} ... .ends")
-    return netlist_text[:dut_match.start()] + extracted_match.group(0) + netlist_text[dut_match.end():]
+
+    dut_header = _SUBCKT_HEADER_RE.match(dut_match.group(0))
+    extracted_header = _SUBCKT_HEADER_RE.match(extracted_match.group(0))
+    dut_ports = dut_header.group(2).split()
+    extracted_ports = extracted_header.group(2).split()
+    if sorted(dut_ports) != sorted(extracted_ports):
+        raise ValueError(
+            f".subckt {block}'s port lists differ between the schematic-derived netlist {dut_ports} "
+            f"and the extracted one {extracted_ports} -- not just a reorder, can't safely splice"
+        )
+
+    extracted_body = extracted_match.group(0)
+    if extracted_ports != dut_ports:
+        new_header_line = f".subckt {extracted_header.group(1)} {' '.join(dut_ports)}\n"
+        extracted_body = new_header_line + extracted_body[extracted_header.end():]
+
+    return netlist_text[:dut_match.start()] + extracted_body + netlist_text[dut_match.end():]
 
 
 def run_extracted(block_cfg, params, test_name, variation=None):
@@ -137,6 +163,16 @@ def run_extracted(block_cfg, params, test_name, variation=None):
         except ValueError as exc:
             return {"status": "error", "error": str(exc)}
         netlist_path.write_text(spliced, encoding="utf-8")
+        # ngspice reads .spiceinit from its own cwd at startup -- this is
+        # where run_one_ngspice() (run_sim.py's own normal-flow runner)
+        # loads the PDK's compact-model OSDI plugins (psp103, r3_cmc,
+        # cap_cmomf/i when present) from, via ctx.spiceinit_text. Missing
+        # here entirely until 2026-10-01: confirmed live every MOSFET
+        # model (even on a schematic-identical splice) failed with
+        # "Unable to find definition of model ...:sg13g2_hv_pmos_psp" --
+        # not a netlist problem, ngspice simply never knew to load the
+        # plugin that defines it.
+        (verify_dir / ".spiceinit").write_text(ctx.spiceinit_text, encoding="utf-8")
 
         data_file = verify_dir / f"{test_name}_0.data"
         data_file.unlink(missing_ok=True)
