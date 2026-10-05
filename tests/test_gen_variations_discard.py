@@ -53,7 +53,7 @@ class RunBatchDiscardTests(unittest.TestCase):
             return outcome
 
         @contextlib.contextmanager
-        def fake_managed_container():
+        def fake_managed_executor():
             self.calls.append("container_enter")
             yield "fake-container-id"
             self.calls.append("container_exit")
@@ -63,7 +63,7 @@ class RunBatchDiscardTests(unittest.TestCase):
 
         return (
             patch("analog_designer.sim.gen_variations.run_variation", side_effect=fake_run_variation),
-            patch("analog_designer.sim.gen_variations.managed_container", fake_managed_container),
+            patch("analog_designer.sim.gen_variations.managed_executor", fake_managed_executor),
             patch("analog_designer.sim.gen_variations.setup_container", return_value=None),
             patch("analog_designer.sim.gen_variations.trim_variation", side_effect=fake_trim_variation),
             patch("analog_designer.core.workspace.cpu_budget", return_value=cpu_budget),
@@ -177,7 +177,7 @@ class RunHierarchicalBatchDiscardTests(unittest.TestCase):
             return outcomes_by_name[name]
 
         @contextlib.contextmanager
-        def fake_managed_container():
+        def fake_managed_executor():
             self.calls.append(("container_enter",))
             yield "fake-container-id"
             self.calls.append(("container_exit",))
@@ -187,7 +187,7 @@ class RunHierarchicalBatchDiscardTests(unittest.TestCase):
 
         return (
             patch("analog_designer.sim.gen_variations.run_variation", side_effect=fake_run_variation),
-            patch("analog_designer.sim.gen_variations.managed_container", fake_managed_container),
+            patch("analog_designer.sim.gen_variations.managed_executor", fake_managed_executor),
             patch("analog_designer.sim.gen_variations.setup_container", return_value=None),
             patch("analog_designer.sim.gen_variations.trim_variation", side_effect=fake_trim_variation),
             patch("analog_designer.core.workspace.cpu_budget", return_value=cpu_budget),

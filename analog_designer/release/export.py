@@ -59,7 +59,7 @@ _META_RE = re.compile(r"\*\*Variation ID:\*\* `([^`]+)`.*?\*\*Exported:\*\* (\S+
 
 
 def _find_variation(variation_name):
-    for row in run_sim._read_jsonl(workspace.PROJECT_ROOT / "sim" / "variations.jsonl"):
+    for row in run_sim._read_jsonl(workspace.sim_root() / "variations.jsonl"):
         if row["name"] == variation_name:
             return row
     sys.exit(f"no such variation in sim/variations.jsonl: {variation_name!r}")
@@ -116,12 +116,16 @@ def _render_schematic_png(container, rcfile, block, dest_doc_dir):
     Returns True on success; a render problem (missing PDK library paths,
     docker hiccup) is logged and returns False rather than blocking the rest
     of the release export, which is still useful without the picture."""
-    container_sch = f"{workspace.container_project_root()}/release/xschem/sch/{block}.sch"
-    container_png = f"{workspace.container_project_root()}/release/doc/{block}/schematic.png"
+    container_sch = workspace.exec_path(workspace.PROJECT_ROOT / "release" / "xschem" / "sch" / f"{block}.sch")
+    container_png = workspace.exec_path(workspace.PROJECT_ROOT / "release" / "doc" / block / "schematic.png")
     dest_png = dest_doc_dir / "schematic.png"
+    tools = run_sim._resolve_tools(container)
+    # --png needs a real X display: the docker image's Xvnc, or in host
+    # mode whatever this machine has (none: the render fails, see above).
+    display = f"export DISPLAY={tools['display']}; " if tools["display"] else ""
     cmd = (
-        f'export DISPLAY=:1; '
-        f'/usr/local/share/xschem/bin/xschem --rcfile "{rcfile}" '
+        f'{display}'
+        f'"{tools["xschem"]}" --rcfile "{rcfile}" '
         f'--preinit "set dark_colorscheme 0" --plotfile "{container_png}" '
         f'--png -q "{container_sch}"'
     )
@@ -368,9 +372,9 @@ def export_release(project_root, variation_name):
             f"these exact choices every time this block is exported."
         )
 
-    with run_sim.managed_container() as container:
+    with run_sim.managed_executor() as container:
         run_sim.ensure_xschemrc(container)
-        rcfile = f"{workspace.container_project_root()}/xschemrc"
+        rcfile = workspace.exec_path(run_sim.project_xschemrc())
 
         result = _export_one(project_root, block, topology, variation_name, params, container, rcfile, dependency_note)
 

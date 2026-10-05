@@ -90,8 +90,8 @@ def main():
         else {n: pdef["default"] for n, pdef in block_cfg["parameters"].items()}
     )
 
-    sim_dir = workspace.PROJECT_ROOT / "sim" / f"_diagnose-{int(time.time())}"
-    container_sim_dir = f"{workspace.container_project_root()}/sim/{sim_dir.name}"
+    sim_dir = workspace.sim_root() / f"_diagnose-{int(time.time())}"
+    container_sim_dir = workspace.exec_path(sim_dir)
 
     print(
         f"diagnosing {len(tests)} test(s) for {workspace.BLOCK}/{workspace.TOPOLOGY} "
@@ -102,7 +102,7 @@ def main():
     timings = []  # (test_name, label, elapsed_seconds, status, ngspice_exit_code)
     try:
         container_rcfile = run_sim.materialize_variation_shadow(sim_dir, block_cfg, params, block=workspace.BLOCK)
-        with run_sim.managed_container() as container:
+        with run_sim.managed_executor() as container:
             ctx = run_sim.setup_container(container)
             for test_name, test_cfg in tests.items():
                 simulator = test_cfg.get("simulator", "ngspice")

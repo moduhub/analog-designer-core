@@ -31,9 +31,15 @@ Usage: python -m analog_designer.sim.update_variations [--from NAME] [--to NAME]
 import argparse
 import sys
 
+from analog_designer.core import console
+from analog_designer.core import console
 from analog_designer.core import workspace
 from analog_designer.sim.gen_variations import _run_batch, add_skip_on_fail_tolerance_args, skip_on_fail_batch_kwargs
 from analog_designer.sim.run_sim import _read_jsonl, validate_skip_on_fail_profile, validate_skip_on_fail_tolerance
+
+print = console.atomic_print  # worker threads share stdout, see core/console.py
+
+print = console.atomic_print  # worker threads share stdout, see core/console.py
 
 
 def select_variations(name_from, name_to):
@@ -44,7 +50,7 @@ def select_variations(name_from, name_to):
     --from that comes after --to -- both almost certainly a mistake, not
     something to silently work around."""
     rows = [
-        r for r in _read_jsonl(workspace.PROJECT_ROOT / "sim" / "variations.jsonl")
+        r for r in _read_jsonl(workspace.sim_root() / "variations.jsonl")
         if r["block"] == workspace.BLOCK and r["topology"] == workspace.TOPOLOGY
     ]
     names = [r["name"] for r in rows]
@@ -74,7 +80,7 @@ def select_variations_by_name(names):
     that doesn't exist for this block/topology, same as select_variations()'s
     own --from/--to validation."""
     rows = [
-        r for r in _read_jsonl(workspace.PROJECT_ROOT / "sim" / "variations.jsonl")
+        r for r in _read_jsonl(workspace.sim_root() / "variations.jsonl")
         if r["block"] == workspace.BLOCK and r["topology"] == workspace.TOPOLOGY
     ]
     by_name = {r["name"]: r for r in rows}
