@@ -148,7 +148,10 @@ _FAKE_XSCHEM = textwrap.dedent("""\
     #!{python}
     import sys
     from pathlib import Path
+    import os
     args = sys.argv[1:]
+    # Real xschemrc files resolve paths against $env(PWD), not the cwd.
+    assert os.environ.get("PWD") == os.getcwd(), (os.environ.get("PWD"), os.getcwd())
     out = Path(args[args.index("-o") + 1])
     sch = Path(args[-1])
     text = sch.read_text()
