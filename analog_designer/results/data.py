@@ -48,17 +48,17 @@ def _filter_scope(rows, all_topologies):
 
 
 def load_variations(all_topologies=False):
-    rows = _read_jsonl(workspace.PROJECT_ROOT / "sim" / "variations.jsonl")
+    rows = _read_jsonl(workspace.sim_root() / "variations.jsonl")
     return _filter_scope(rows, all_topologies)
 
 
 def load_results(all_topologies=False):
-    rows = _read_jsonl(workspace.PROJECT_ROOT / "sim" / "results.jsonl")
+    rows = _read_jsonl(workspace.sim_root() / "results.jsonl")
     return _filter_scope(rows, all_topologies)
 
 
 def load_runs(variation_name):
-    return _read_jsonl(workspace.PROJECT_ROOT / "sim" / variation_name / "runs.jsonl")
+    return _read_jsonl(workspace.sim_root() / variation_name / "runs.jsonl")
 
 
 def diagnostics_for_variation(variation_name, test_name=None):
@@ -191,7 +191,7 @@ def plot_paths_for(variation, test):
     gets <suffix> prettified (underscores -> spaces, title-cased) as its
     label -- lets a parser generate any number of named views (0, 1, or
     many) without the GUI needing to know in advance which ones exist."""
-    test_dir = workspace.PROJECT_ROOT / "sim" / variation / test
+    test_dir = workspace.sim_root() / variation / test
     if not test_dir.exists():
         return []
     results = []
@@ -291,14 +291,14 @@ def matching_variations(block, topology, profile_name=None):
     honored, not a hard requirement that can strand a block with no (or no
     matching) profiles."""
     variations = [
-        r for r in _read_jsonl(workspace.PROJECT_ROOT / "sim" / "variations.jsonl")
+        r for r in _read_jsonl(workspace.sim_root() / "variations.jsonl")
         if r["block"] == block and r["topology"] == topology
     ]
     if profile_name is None:
         return [v["name"] for v in variations]
 
     results = [
-        r for r in _read_jsonl(workspace.PROJECT_ROOT / "sim" / "results.jsonl")
+        r for r in _read_jsonl(workspace.sim_root() / "results.jsonl")
         if r["block"] == block and r["topology"] == topology
     ]
     metrics_by_variation = {}

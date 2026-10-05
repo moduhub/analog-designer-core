@@ -109,7 +109,7 @@ def run_extracted(block_cfg, params, test_name, variation=None):
 
     defaults = workspace.CONFIG["defaults"]
     name = variation_name(block, topology, params)
-    sim_dir = workspace.PROJECT_ROOT / "sim" / name
+    sim_dir = workspace.sim_root() / name
     # analog_designer_pro.layout.magic_layout.stage_extract's own output --
     # the FULL parasitic netlist, gated there on a clean LVS -- not
     # stage_lvs's own connectivity-only <block>_extracted_lvs.spice.
@@ -148,7 +148,7 @@ def run_extracted(block_cfg, params, test_name, variation=None):
         if vdd_values and len(vdd_values) == 1 and not (sweep_axis and sweep_axis[0] == "vdd"):
             tb_params_base["vdd"] = tb_params_base["Vavdd"] = vdd_values[0]
 
-        container_sim_dir = f"{workspace.container_project_root()}/sim/{name}"
+        container_sim_dir = workspace.exec_path(sim_dir)
         container_verify_dir = f"{container_sim_dir}/layout_verify/{test_name}"
         netlist_result = _netlist(
             ctx.container, test_name, tb_source, typical, tb_params_base,
@@ -177,7 +177,7 @@ def run_extracted(block_cfg, params, test_name, variation=None):
         data_file = verify_dir / f"{test_name}_0.data"
         data_file.unlink(missing_ok=True)
         sim_result = docker_exec(
-            ctx.container, f'cd "{container_verify_dir}" && timeout 290 ngspice -b {netlist_path.name}', timeout=300,
+            ctx.container, f'cd "{container_verify_dir}" && timeout 290 "{ctx.ngspice}" -b {netlist_path.name}', timeout=300,
         )
         if not data_file.exists():
             return {"status": "error", "error": (sim_result.stdout + sim_result.stderr)[-2000:]}

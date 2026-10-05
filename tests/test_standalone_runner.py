@@ -1,32 +1,32 @@
-"""Tests for analog_designer/standalone/run_tb.py -- the stdlib-only,
-docker-free testbench runner that gets vendored into project repos -- and
-for its export command.
+"""Tests for host/docker execution (analog_designer/core/executor.py and
+workspace's execution settings) and for the standalone runner: the CLI
+(analog_designer/standalone/cli.py) and the tools/run_tb.py bundle export.py
+generates from it.
 
-Two kinds of checks, both on a small self-contained fixture project:
-  * parity: the standalone copy of each pure pipeline function (parameter
-    resolution, condition grid, testbench placeholders, definition hash,
-    PDK corner tables, Xyce netlist fixups) gives exactly what run_sim.py
-    gives for the same input, so a vendored runner can't silently drift
-    from the core;
-  * end to end: a full run against fake xschem/ngspice executables (tiny
-    Python scripts), covering --dry leaving the project untouched and the
-    default mode writing sim/ results the core itself sees as fresh.
+The end-to-end checks run the real run_sim.py pipeline in host mode on a
+small fixture project, against fake xschem/ngspice executables (tiny Python
+scripts), so they need no EDA tools: --dry leaving the project untouched,
+the default mode writing sim/ results the core sees as fresh, --where,
+hierarchical import_metrics, and the generated bundle running in a fresh
+interpreter that can't import this checkout.
 """
 import contextlib
 import io
 import json
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from analog_designer.core import workspace
+from analog_designer.core import executor, settings, workspace
 from analog_designer.sim import run_sim
-from analog_designer.standalone import export
-from analog_designer.standalone import run_tb
+from analog_designer.standalone import cli, export
 
 _CONFIG = {
     "container": {"image": "eda-env-designer:ihp-fake"},
@@ -221,132 +221,125 @@ def _snapshot(root):
     return {str(p.relative_to(root)): p.stat().st_mtime_ns for p in root.rglob("*")}
 
 
+
 class _FixtureCase(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
-        base = Path(self._tmp.name)
+        base = Path(self._tmp.name).resolve()
         self.root = base / "proj"
         _make_project(self.root)
         self.tool_args = _make_tools(base)
         self.base = base
-        patcher = mock.patch.object(workspace, "_LAST_FOLDER_FILE", base / "last_folder.txt")
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        for target, attr, value in (
+            (workspace, "_LAST_FOLDER_FILE", base / "last_folder.txt"),
+            (settings, "_SETTINGS_FILE", base / "settings.json"),
+        ):
+            patcher = mock.patch.object(target, attr, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        env = mock.patch.dict(os.environ, {"PDK_ROOT": "", "PDK": "", "ANALOG_DESIGNER_EXECUTION": ""})
+        env.start()
+        self.addCleanup(env.stop)
         self.addCleanup(self._tmp.cleanup)
+        self.addCleanup(workspace.reset_overrides)
         saved_path = list(sys.path)
         self.addCleanup(lambda: sys.path.__setitem__(slice(None), saved_path))
 
-    def run_tb(self, *args):
+    def run_cli(self, *args):
         out = io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
-            rc = run_tb.main(["--project-root", str(self.root), *self.tool_args, *args])
+            try:
+                rc = cli.main(["--project-root", str(self.root), *self.tool_args, *args])
+            except SystemExit as exc:
+                rc = exc.code
         return rc, out.getvalue()
 
     def open_core(self, block, topology):
-        workspace.open_folder(str(self.root), block=block, topology=topology)
+        workspace.open_folder(str(self.root), block=block, topology=topology, remember=False)
         return workspace.CONFIG["blocks"][block]["topologies"][topology]
 
 
-class ParityTests(_FixtureCase):
-    def test_condition_grid_and_testbench_params_match_run_sim(self):
-        defaults = _CONFIG["defaults"]
-        cases = [
-            ({"conditions": {}}, ""),
-            (_CONFIG["tests"]["core"]["level"], _TB_CORE),
-            (_CONFIG["tests"]["core"]["tsweep"], _TB_TSWEEP),
-            ({"conditions": {"vdd": ["2.97", "3.63"], "corner": ["tt", "ss", "ff"]}}, "'vdd_min' 'vdd_max'"),
-            ({"conditions": {"corner": ["tt_mismatch"], "mc_seed": ["1", "2", "3"], "res_corner": ["typ_mismatch"]}},
-             "'mc_seed' 'res_corner'"),
-            ({"conditions": {"frequency_start": ["10"], "typical": {"corner": "tt"}}}, "'frequency_start'"),
-        ]
-        for test_cfg, tb_text in cases:
-            with self.subTest(test_cfg=test_cfg):
-                axis = run_sim.internal_sweep_axis(test_cfg, tb_text)
-                self.assertEqual(run_tb.internal_sweep_axis(test_cfg, tb_text), axis)
-                self.assertEqual(run_tb.fixed_tb_params(test_cfg, tb_text, axis),
-                                 run_sim.fixed_tb_params(test_cfg, tb_text, axis))
-                core_grid = list(run_sim.condition_matrix(test_cfg, defaults, axis))
-                self.assertEqual(list(run_tb.condition_matrix(test_cfg, defaults, axis)), core_grid)
-                self.assertEqual([run_tb.condition_label(c) for c in core_grid],
-                                 [run_sim.condition_label(c) for c in core_grid])
-                self.assertEqual(run_tb.typical_conditions(test_cfg, defaults),
-                                 run_sim.typical_conditions(test_cfg, defaults))
+class ExecutionSettingsTests(_FixtureCase):
+    def test_docker_is_the_default_and_settings_choose_host(self):
+        self.open_core("core", "a")
+        self.assertEqual(workspace.execution_mode(), "docker")
+        self.assertEqual(workspace.container_project_root(), "/home/moduhub/work/proj")
+        stored = settings.load()
+        stored["execution"]["mode"] = "host"
+        settings.save(stored)
+        self.assertEqual(workspace.execution_mode(), "host")
+        self.assertEqual(workspace.container_project_root(), self.root.as_posix())
 
-    def test_corner_tables_match_run_sim(self):
-        self.assertEqual(run_tb.MOS_CORNER_SECTION, run_sim.MOS_CORNER_SECTION)
-        self.assertEqual(run_tb.MOS_CORNER_SECTION_GF180MCU, run_sim.MOS_CORNER_SECTION_GF180MCU)
-        self.assertEqual(run_tb.RES_CORNER_SECTION, run_sim.RES_CORNER_SECTION)
-        self.assertEqual(run_tb._RES_SECTION_CMOS5L, run_sim._RES_SECTION_CMOS5L)
-        self.assertEqual(run_tb.INTERNAL_SWEEP_AXES, run_sim.INTERNAL_SWEEP_AXES)
-        self.assertEqual(run_tb._NON_FIXED_CONDITION_KEYS, run_sim._NON_FIXED_CONDITION_KEYS)
+    def test_override_beats_environment_beats_settings(self):
+        self.open_core("core", "a")
+        with mock.patch.dict(os.environ, {"ANALOG_DESIGNER_EXECUTION": "host"}):
+            self.assertEqual(workspace.execution_mode(), "host")
+            workspace.set_overrides(mode="docker")
+            self.assertEqual(workspace.execution_mode(), "docker")
 
-    def test_materialization_and_definition_hash_match_run_sim(self):
-        block_cfg = self.open_core("core", "a")
-        project = run_tb.Project(self.root, self.root / "sim", persist=True)
-        sa_cfg = project.topology_cfg("core", "a")
-        params = run_tb.default_params(sa_cfg)
-        self.assertEqual(params, {n: p["default"] for n, p in block_cfg["parameters"].items()})
-        self.assertEqual(run_tb.variation_name("core", "a", params), run_sim.variation_name("core", "a", params))
-        core_resolved = run_sim.resolve_materialization_params(block_cfg, params, sch_dir=self.base / "core_sch")
-        sa_resolved = run_tb.resolve_materialization_params(project, sa_cfg, params, self.base / "sa_sch")
-        self.assertEqual(sa_resolved, core_resolved)
-        self.assertEqual(sa_resolved["w_m1"], "3u")
-        self.assertEqual(sa_resolved["l_seg"], "10u")
-        for test_name, test_cfg in _CONFIG["tests"]["core"].items():
-            with self.subTest(test=test_name):
-                self.assertEqual(run_tb.compute_definition_hash(project, sa_cfg, test_cfg),
-                                 run_sim.compute_definition_hash(block_cfg, test_cfg))
+    def test_exec_path_maps_into_the_container_and_refuses_outside_paths(self):
+        self.open_core("core", "a")
+        self.assertEqual(workspace.exec_path(self.root / "sim" / "v" / "t"), "/home/moduhub/work/proj/sim/v/t")
+        with self.assertRaises(ValueError):
+            workspace.exec_path(self.base / "elsewhere")
+        workspace.set_overrides(mode="host")
+        self.assertEqual(workspace.exec_path(self.base / "elsewhere"), (self.base / "elsewhere").as_posix())
 
-    def test_hierarchical_materialization_matches_run_sim(self):
-        core_sub = run_sim.variation_name("core", "a", {"w_base": "2u", "w_factor": "2", "l_total": "5u"})
-        sim = self.root / "sim"
-        _write(sim / "variations.jsonl", json.dumps({
-            "name": core_sub, "block": "core", "topology": "a",
-            "parameters": {"w_base": "2u", "w_factor": "2", "l_total": "5u"}}) + "\n")
-        _write(sim / "results.jsonl", json.dumps({
-            "variation": core_sub, "test": "level", "metric": "Level",
-            "typical": 1.2, "min": 1.1, "max": 1.3}) + "\n")
-        block_cfg = self.open_core("top", "default")
-        project = run_tb.Project(self.root, sim, persist=True)
-        params = {"X1_variation": core_sub, "bias_factor": "2"}
-        core_dir, sa_dir = self.base / "core_sch", self.base / "sa_sch"
-        core_dir.mkdir()
-        sa_dir.mkdir()
-        core_resolved = run_sim.resolve_materialization_params(block_cfg, params, sch_dir=core_dir)
-        sa_resolved = run_tb.resolve_materialization_params(
-            project, project.topology_cfg("top", "default"), params, sa_dir)
-        self.assertEqual(sa_resolved, core_resolved)
-        self.assertEqual(sa_resolved["bias_w"], "8u")
-        self.assertEqual((sa_dir / "core.sch").read_text(), (core_dir / "core.sch").read_text())
+    def test_host_pdk_falls_back_to_the_image_tag(self):
+        self.open_core("core", "a")
+        self.assertEqual(workspace.host_pdk(), ("", "ihp-fake"))
+        with mock.patch.dict(os.environ, {"PDK_ROOT": "/pdks", "PDK": "ihp-other"}):
+            self.assertEqual(workspace.host_pdk(), ("/pdks", "ihp-other"))
+            workspace.set_overrides(pdk="gf180mcuD")
+            self.assertEqual(workspace.host_pdk(), ("/pdks", "gf180mcuD"))
 
-    def test_xyce_netlist_fixups_match_run_sim(self):
-        netlist = textwrap.dedent("""\
-            .lib /m/cornerCAP.lib cap_typ
-            .save i(vmeas)
-            XC1 a b cap_cmomf w=10u l=5u mmin=1 mmax=3 m=2
-            XC2 c d cap_cmomf w=1u l=1u
-            .end
-        """)
-        core_path, sa_path = self.base / "core.spice", self.base / "sa.spice"
-        core_path.write_text(netlist)
-        sa_path.write_text(netlist)
-        run_sim._strip_ngspice_save_lines(core_path)
-        run_sim._lower_cmomf_for_xyce(core_path)
-        run_tb._prepare_xyce_netlist(sa_path)
-        self.assertEqual(sa_path.read_text(), core_path.read_text())
-
-    def test_ngspice_error_detection_matches_log_diagnostics(self):
-        from analog_designer.sim import log_diagnostics
-        log = "Error: no such vector v(x)\n  tran simulation(s) aborted\ndoAnalyses: TRAN:  Timestep too small\nWarning: meh\n"
-        core = sorted(d["message"] for d in log_diagnostics.parse(log, "ngspice") if d["severity"] == "error")
-        self.assertEqual(sorted(run_tb._ngspice_errors(log)), core)
+    def test_settings_written_before_execution_modes_still_load(self):
+        settings._SETTINGS_FILE.write_text(json.dumps({"container": {"image": "x:y", "max_parallel": 3}}))
+        loaded = settings.load()
+        self.assertEqual(loaded["execution"], {"mode": "docker"})
+        self.assertEqual(loaded["container"]["cpu_budget"], 3)
 
 
-class EndToEndTests(_FixtureCase):
+class HostExecutorTests(unittest.TestCase):
+    def test_runs_bash_in_its_own_directory(self):
+        result = executor.HostExecutor().run('cd /tmp && echo "$PWD" && exit 3')
+        self.assertEqual(result.returncode, 3)
+        self.assertEqual(result.stdout.strip(), "/tmp")
+
+    def test_timeout_kills_the_whole_process_group(self):
+        marker = Path(tempfile.mkdtemp()) / "survivor"
+        start = time.monotonic()
+        result = executor.HostExecutor().run(f'(sleep 2; touch "{marker}") & sleep 5', timeout=1)
+        self.assertEqual(result.returncode, 124)
+        self.assertLess(time.monotonic() - start, 4)
+        time.sleep(1.5)
+        self.assertFalse(marker.exists(), "a child of the timed-out script kept running")
+
+    def test_sigterm_takes_running_host_scripts_down_too(self):
+        """What the GUI's Cancel relies on in host mode."""
+        marker = Path(tempfile.mkdtemp()) / "survivor"
+        job = subprocess.Popen([sys.executable, "-c", textwrap.dedent(f"""
+            from analog_designer.core import executor
+            executor.kill_host_jobs_on_terminate()
+            print("started", flush=True)
+            executor.HostExecutor().run('sleep 3; touch "{marker}"', timeout=30)
+        """)], stdout=subprocess.PIPE, text=True)
+        self.assertEqual(job.stdout.readline().strip(), "started")
+        time.sleep(0.5)
+        job.terminate()
+        job.wait(timeout=10)
+        time.sleep(3.5)
+        self.assertFalse(marker.exists(), "the simulator kept running after its job was terminated")
+
+    def test_docker_exec_dispatches_to_an_executor(self):
+        self.assertEqual(run_sim.docker_exec(executor.HostExecutor(), "echo hi").stdout, "hi\n")
+
+
+class StandaloneCliTests(_FixtureCase):
     def test_dry_run_leaves_the_project_untouched(self):
         before = _snapshot(self.root)
         summary_path = self.base / "summary.json"
-        rc, out = self.run_tb("--block", "core", "--dry", "--json", str(summary_path))
+        rc, out = self.run_cli("--block", "core", "--dry", "--json", str(summary_path))
         self.assertEqual(rc, 0, out)
         self.assertEqual(_snapshot(self.root), before)
         summary = json.loads(summary_path.read_text())
@@ -357,7 +350,7 @@ class EndToEndTests(_FixtureCase):
         self.assertEqual(summary["tests"]["tsweep"]["status"], "success")
 
     def test_default_mode_writes_results_the_core_sees_as_fresh(self):
-        rc, out = self.run_tb("--block", "core")
+        rc, out = self.run_cli("--block", "core")
         self.assertEqual(rc, 0, out)
         block_cfg = self.open_core("core", "a")
         params = {n: p["default"] for n, p in block_cfg["parameters"].items()}
@@ -366,74 +359,117 @@ class EndToEndTests(_FixtureCase):
             workspace.CONFIG["tests"]["core"], block_cfg, run_sim.load_results(), name, False)
         self.assertEqual(sorted(fresh), ["area", "level", "tsweep"])
         self.assertEqual(to_run, {})
-        self.assertTrue(any(r["name"] == name for r in run_sim._read_jsonl(self.root / "sim" / "variations.jsonl")))
         runs = run_sim._read_jsonl(self.root / "sim" / name / "runs.jsonl")
         self.assertEqual(len(runs), 1 + 8 + 4)
-        # Materialized only into the per-variation shadow tree, never sch/.
+        # Shadow materialization only: the tracked sch/ tree is never written.
         self.assertFalse((self.root / "sch" / "core.sch").exists())
         self.assertIn("w=3u", (self.root / "sim" / name / "_src" / "sch" / "core.sch").read_text())
-        # The internal temperature sweep bounds reached the testbench.
         tsweep = next((self.root / "sim" / name / "tsweep").glob("*/tb_tsweep.spice")).read_text()
         self.assertIn(".dc temp -40.0 125.0 5", tsweep)
-        # Aux outputs (the .raw) are dropped after a successful run.
-        self.assertEqual(list((self.root / "sim" / name).rglob("*.raw")), [])
+        self.assertEqual(list((self.root / "sim" / name).rglob("*.raw")), [])  # aux outputs dropped
 
-        rc, out = self.run_tb("--block", "core")
+        rc, out = self.run_cli("--block", "core")
         self.assertEqual(rc, 0, out)
-        self.assertIn("skipping level: fresh result", out)
+        self.assertIn("SKIPPED, fresh result", out)
 
-    def test_where_filter_runs_a_subset_and_records_nothing(self):
-        rc, out = self.run_tb("--block", "core", "--test", "level", "--where", "corner=tt", "--where", "ibias=80n")
+    def test_where_runs_a_subset_and_records_nothing(self):
+        rc, out = self.run_cli("--block", "core", "--test", "level", "--where", "corner=tt", "--where", "ibias=80n")
         self.assertEqual(rc, 0, out)
-        self.assertIn("running 2 simulation(s)", out)
+        self.assertIn("not recorded", out)
+        self.assertEqual(len(run_sim._read_jsonl(next((self.root / "sim").glob("core-a-*/runs.jsonl")))), 2)
         self.assertFalse((self.root / "sim" / "results.jsonl").exists())
 
-    def test_hierarchical_block_needs_and_uses_sub_block_results(self):
-        rc, out = self.run_tb("--block", "top", "--dry")
-        self.assertEqual(rc, 2)
+    def test_hierarchical_block_uses_stored_or_given_sub_block_metrics(self):
+        rc, out = self.run_cli("--block", "top", "--dry")
+        self.assertNotEqual(rc, 0)
         self.assertIn("X1_variation", out)
-        rc, out = self.run_tb("--block", "top", "--dry", "--import-metric", "x1_level=1.5")
+        rc, out = self.run_cli("--block", "top", "--dry", "--import-metric", "x1_level=1.5")
         self.assertEqual(rc, 0, out)
 
-        rc, out = self.run_tb("--block", "core", "--test", "level")
+        rc, out = self.run_cli("--block", "core", "--test", "level")
         self.assertEqual(rc, 0, out)
-        core_name = run_tb.variation_name("core", "a", {"w_base": "1u", "w_factor": "3", "l_total": "20u"})
-        summary_path = self.base / "top.json"
-        rc, out = self.run_tb("--block", "top", "--param", f"X1_variation={core_name}", "--dry",
-                              "--keep", "--json", str(summary_path))
+        core_name = run_sim.variation_name("core", "a", {"w_base": "1u", "w_factor": "3", "l_total": "20u"})
+        rc, out = self.run_cli("--block", "top", "--param", f"X1_variation={core_name}", "--dry", "--keep")
         self.assertEqual(rc, 0, out)
         work = Path(out.split("kept work directory: ")[1].split()[0])
-        self.addCleanup(lambda: __import__("shutil").rmtree(work, ignore_errors=True))
-        top_sch = next(work.glob("top-default-*/_src/sch/top.sch")).read_text()
+        self.addCleanup(shutil.rmtree, work, True)
+        top_sch = next(work.glob("sim/top-default-*/_src/sch/top.sch")).read_text()
         self.assertIn("w=6u", top_sch)          # x1_w (3u) * bias_factor (2)
         self.assertIn("r=1.025e+06", top_sch)   # stored X1 Level typical * 1e6
 
     def test_missing_tools_are_reported_before_running(self):
-        rc, out = self.run_tb("--block", "core", "--dry", "--ngspice", str(self.base / "nope"), "--pdk", "absent")
+        rc, out = self.run_cli("--block", "core", "--dry", "--ngspice", str(self.base / "nope"), "--pdk", "absent")
         self.assertEqual(rc, 2)
-        self.assertIn("PDK directory not found", out)
+        self.assertIn("PDK directory", out)
+        self.assertIn("ngspice not found", out)
 
     def test_list(self):
-        rc, out = self.run_tb("--list")
-        self.assertEqual(rc, 0)
-        self.assertIn("tsweep", out)
-        self.assertIn("4 condition(s)", out)  # temperature swept internally: corner x vdd only
+        rc, out = self.run_cli("--list")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("4 condition(s)", out)  # tsweep: temperature swept inside the testbench
 
 
-class ExportTests(_FixtureCase):
-    def test_export_writes_a_stamped_copy_that_check_accepts(self):
+class ProjectSwitchTests(_FixtureCase):
+    def test_parsers_use_the_open_projects_shared_helpers(self):
+        """The GUI's Open Folder keeps one process across projects: a parser
+        of the second project must not import the first one's
+        tb/_shared/parser_common.py (sys.path + sys.modules)."""
+        other = self.base / "other"
+        _make_project(other)
+        _write(other / "tb" / "_shared" / "parser_common.py", "def read_value(path):\n    return -1.0\n")
+        data = self.base / "x.data"
+        data.write_text("0 2.5\n")
+        workspace.open_folder(str(other), remember=False)
+        self.assertEqual(run_sim.load_parser("tb/core/tb_level.py").extract(data), {"value": -1.0})
+        workspace.open_folder(str(self.root), remember=False)
+        self.assertEqual(run_sim.load_parser("tb/core/tb_level.py").extract(data), {"value": 2.5})
+
+
+class BundleTests(_FixtureCase):
+    def test_bundle_covers_the_pipeline_and_nothing_gui(self):
+        files = export.bundled_files()
+        for needed in ("analog_designer/sim/run_sim.py", "analog_designer/core/executor.py",
+                       "analog_designer/standalone/cli.py", "analog_designer/sim/openems_generator_runner.py"):
+            self.assertIn(needed, files)
+        self.assertFalse([f for f in files if "/gui/" in f])
+
+    def test_generated_runner_works_without_this_checkout(self):
         with contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(export.main([str(self.root), "--check"]), 1)
             self.assertEqual(export.main([str(self.root)]), 0)
-            self.assertEqual(export.main([str(self.root), "--check"]), 0)
+        runner = self.root / "tools" / "run_tb.py"
+        before = _snapshot(self.root)
+        env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+        result = subprocess.run(
+            [sys.executable, "-I", str(runner), "--block", "core", "--test", "level", "--dry", *self.tool_args],
+            cwd=self.base, env=env, capture_output=True, text=True, timeout=120,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Level", result.stdout)
+        self.assertEqual(_snapshot(self.root), before)
+        self.assertFalse(list(Path(tempfile.gettempdir()).glob("run_tb_src_*")), "bundle sources left behind")
+
+    def test_status_follows_the_tool_version(self):
         dest = self.root / "tools" / "run_tb.py"
-        lines = dest.read_text().splitlines()
-        self.assertTrue(lines[0].startswith("#!"))
-        self.assertTrue(lines[1].startswith(export.STAMP_PREFIX))
+        self.assertEqual(export.runner_status(self.root), "missing")
+        export.export_runner(self.root)
+        self.assertEqual(export.runner_status(self.root), "current")
         self.assertTrue(os.access(dest, os.X_OK))
-        dest.write_text(dest.read_text() + "# local edit\n")
-        with contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(export.main([str(self.root), "--check"]), 1)
+        dest.write_text(dest.read_text().replace("#|", "#|# changed\n#|", 1))
+        self.assertEqual(export.runner_status(self.root), "stale")
+        self.assertEqual(export.sync_runner(self.root), dest)
+        self.assertEqual(export.runner_status(self.root), "current")
+        self.assertIsNone(export.sync_runner(self.root))
+
+    def test_hand_written_files_are_never_overwritten(self):
+        dest = self.root / "tools" / "run_tb.py"
+        _write(dest, "print('mine')\n")
+        self.assertEqual(export.runner_status(self.root), "foreign")
+        self.assertIsNone(export.sync_runner(self.root))
+        with self.assertRaises(SystemExit), contextlib.redirect_stdout(io.StringIO()):
+            export.main([str(self.root)])
+        self.assertEqual(dest.read_text(), "print('mine')\n")
+        _write(dest, "#!/usr/bin/env python3\n# vendored from analog-designer-core abc123\n")
+        self.assertEqual(export.runner_status(self.root), "stale")  # the first, hand-synced runner
 
 
 if __name__ == "__main__":

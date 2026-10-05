@@ -36,13 +36,25 @@ from pathlib import Path
 
 _SETTINGS_FILE = Path.home() / ".mh-analog-designer" / "settings.json"
 
+#: execution.mode: where simulators run -- "docker" (a fresh container of
+#: container.image per job, the original and default behavior) or "host"
+#: (xschem/ngspice/Xyce called directly on this machine, e.g. when this
+#: tool itself runs inside the EDA image). host.pdk_root/host.pdk: the PDK
+#: for host mode; empty means $PDK_ROOT/$PDK from the environment, and an
+#: unset PDK falls back to the tag of the project's container.image. See
+#: analog_designer/core/executor.py. cpu_budget stays under "container" for
+#: compatibility with existing settings.json files, though it applies to
+#: both modes.
 DEFAULTS = {
     "container": {
         "image": "eda-env-designer:ihp-sg13g2",
         "project_root_template": "/home/moduhub/work/{name}",
         "cpu_budget": os.cpu_count() or 1,
     },
+    "execution": {"mode": "docker"},
+    "host": {"pdk_root": "", "pdk": ""},
 }
+EXECUTION_MODES = ("docker", "host")
 
 
 def load():
@@ -65,6 +77,8 @@ def load():
         if "max_parallel" in stored_container and "cpu_budget" not in stored_container:
             stored_container["cpu_budget"] = stored_container["max_parallel"]
         settings["container"].update(stored_container)
+        for section in ("execution", "host"):
+            settings[section].update(stored.get(section, {}))
     return settings
 
 

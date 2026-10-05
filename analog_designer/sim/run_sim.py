@@ -50,6 +50,9 @@ import threading
 import time
 from pathlib import Path
 
+from analog_designer.core import executor as executors
+from analog_designer.core import console
+from analog_designer.core import console
 from analog_designer.core import workspace
 from analog_designer.results import fom
 from analog_designer.sim import log_diagnostics
@@ -57,6 +60,10 @@ from analog_designer.sim import raw_peaks
 from analog_designer.sim import soa_check
 from analog_designer.sim import spice_devices
 from analog_designer.sim.spice_value import _match, format_spice_value, parse_spice_value
+
+print = console.atomic_print  # worker threads share stdout, see core/console.py
+
+print = console.atomic_print  # worker threads share stdout, see core/console.py
 
 PARAM_TOKEN_RE = re.compile(r"'([A-Za-z_][A-Za-z0-9_]*)'")
 
@@ -304,6 +311,27 @@ def _cap_ngspice_threads(container_id):
 
 
 @contextlib.contextmanager
+def managed_executor():
+    """Where this job's simulators run, for the length of one `with` block
+    (one script invocation): a HostExecutor in host mode (see
+    workspace.execution_mode() and analog_designer/core/executor.py) -- the
+    tools on this machine, with the PDK from workspace.host_pdk() -- or, in
+    docker mode, a fresh container, see managed_container()."""
+    if workspace.execution_mode() == "host":
+        pdk_root, pdk = workspace.host_pdk()
+        env = {"OMP_NUM_THREADS": "1"}
+        if pdk_root:
+            env["PDK_ROOT"] = pdk_root
+        if pdk:
+            env["PDK"] = pdk
+        executors.kill_host_jobs_on_terminate()
+        yield executors.HostExecutor(env)
+        return
+    with managed_container() as container:
+        yield container
+
+
+@contextlib.contextmanager
 def managed_container():
     """Container lifetime = one `with` block, matching one script
     invocation (a CLI run or one GUI-triggered job) -- never one simulation,
@@ -360,12 +388,18 @@ def managed_container():
     _cap_ngspice_threads(container_id)
     emit_progress_container(container_id)
     try:
-        yield container_id
+        yield executors.DockerExecutor(container_id)
     finally:
         subprocess.run(["docker", "stop", container_id], capture_output=True, text=True)
 
 
 def docker_exec(container, script, timeout=120):
+    """Runs one bash script wherever this job's simulators run -- `container`
+    is the executor managed_executor() yielded (a bare container id string,
+    from older callers, still means that docker container). Name kept for
+    compatibility: it is the one entry point for both execution modes."""
+    if not isinstance(container, str):
+        return container.run(script, timeout=timeout)
     try:
         return subprocess.run(
             ["docker", "exec", container, "bash", "-lc", script],
@@ -410,13 +444,25 @@ def get_pdk_name(container):
     return pdk_name
 
 
-def ensure_xschemrc(container):
+def project_xschemrc():
+    """The xschemrc every netlist run uses: the project's own (gitignored,
+    copied from the PDK on first use), or -- when the project tree must not
+    be written (workspace.read_only_project()) and has none yet -- a copy
+    under workspace.sim_root()."""
     rc_path = workspace.PROJECT_ROOT / "xschemrc"
+    if rc_path.exists() or not workspace.read_only_project():
+        return rc_path
+    return workspace.sim_root() / "xschemrc"
+
+
+def ensure_xschemrc(container):
+    rc_path = project_xschemrc()
     if rc_path.exists():
         return
     result = docker_exec(container, 'cat "$PDK_ROOT/$PDK/libs.tech/xschem/xschemrc"')
     if result.returncode != 0 or not result.stdout.strip():
-        sys.exit(f"Could not fetch default xschemrc from container:\n{result.stderr}")
+        sys.exit(f"Could not fetch default xschemrc from the PDK:\n{result.stderr}")
+    rc_path.parent.mkdir(parents=True, exist_ok=True)
     rc_path.write_text(result.stdout)
     print(f"created {rc_path}")
 
@@ -509,6 +555,13 @@ def lookup_cross_block_metric(from_variation, test_name, metric, stat="typical")
     return matches[-1][stat]
 
 
+#: {import_metrics name: value} given by hand (the standalone runner's
+#: --import-metric), used instead of looking the metric up in
+#: sim/results.jsonl -- the only way to materialize a hierarchical block in a
+#: fresh checkout that has no stored sub-block results yet.
+IMPORT_METRIC_OVERRIDES = {}
+
+
 def resolve_import_metrics(block_cfg, params, sub_block_variation_names):
     """derived_parameters.import_metrics: pure fetch of an already-registered
     sub_blocks instance variation's own stored test result (sim/results.jsonl)
@@ -531,6 +584,9 @@ def resolve_import_metrics(block_cfg, params, sub_block_variation_names):
     unambiguous arithmetic in the formula's own `expr` string."""
     resolved = dict(params)
     for name, entry in block_cfg.get("derived_parameters", {}).get("import_metrics", {}).items():
+        if name in IMPORT_METRIC_OVERRIDES:
+            resolved[name] = IMPORT_METRIC_OVERRIDES[name]
+            continue
         from_instance = entry["from"]
         from_variation = sub_block_variation_names[from_instance]
         if from_variation == BLOCK_REF_DEFAULT:
@@ -1002,7 +1058,7 @@ def ensure_variation_registered(name, block, topology, params, origin=None):
     invocations, which don't go through a generator script. Existing rows
     predate this field entirely -- readers must use row.get("origin"), not
     row["origin"]."""
-    path = workspace.PROJECT_ROOT / "sim" / "variations.jsonl"
+    path = workspace.sim_root() / "variations.jsonl"
     if any(r["name"] == name for r in _read_jsonl(path)):
         return
     _append_jsonl(path, {
@@ -1029,7 +1085,7 @@ def append_run(variation, test_name, label, conditions, outcome):
     exit_code = outcome.get("ngspice_exit_code")
     if exit_code is None:
         exit_code = outcome.get("xyce_exit_code")
-    _append_jsonl(workspace.PROJECT_ROOT / "sim" / variation / "runs.jsonl", {
+    _append_jsonl(workspace.sim_root() / variation / "runs.jsonl", {
         "variation": variation,
         "test": test_name,
         "condition": label,
@@ -1114,7 +1170,7 @@ def git_info():
 
 
 def load_results():
-    return _read_jsonl(workspace.PROJECT_ROOT / "sim" / "results.jsonl")
+    return _read_jsonl(workspace.sim_root() / "results.jsonl")
 
 
 def is_test_fresh(results, name, test_name, definition_hash):
@@ -1340,7 +1396,7 @@ def append_results(name, block, topology, test_name, definition_hash, metrics, g
     this file's existing convention for per-metric fields that not every
     caller can supply (mean/std/minimum/maximum are all .get()-based
     already)."""
-    path = workspace.PROJECT_ROOT / "sim" / "results.jsonl"
+    path = workspace.sim_root() / "results.jsonl"
     created = datetime.datetime.now().isoformat(timespec="seconds")
     for metric in metrics:
         _append_jsonl(path, {
@@ -1374,9 +1430,9 @@ def trim_variation(name):
     pro's own variation generators), since those
     append to the same two JSONL files this rewrites; callers are
     responsible for that mutual exclusion (see analog_designer/gui/app.py)."""
-    _rewrite_jsonl(workspace.PROJECT_ROOT / "sim" / "variations.jsonl", lambda r: r["name"] != name)
-    _rewrite_jsonl(workspace.PROJECT_ROOT / "sim" / "results.jsonl", lambda r: r["variation"] != name)
-    sim_dir = workspace.PROJECT_ROOT / "sim" / name
+    _rewrite_jsonl(workspace.sim_root() / "variations.jsonl", lambda r: r["name"] != name)
+    _rewrite_jsonl(workspace.sim_root() / "results.jsonl", lambda r: r["variation"] != name)
+    sim_dir = workspace.sim_root() / name
     if sim_dir.exists():
         shutil.rmtree(sim_dir)
 
@@ -1397,7 +1453,7 @@ def purge_stale_results(names):
     still-fresh (variation, test) results alone. Returns how many
     (variation, test) keys were purged."""
     names = set(names)
-    results_path = workspace.PROJECT_ROOT / "sim" / "results.jsonl"
+    results_path = workspace.sim_root() / "results.jsonl"
     rows = [r for r in _read_jsonl(results_path) if r["variation"] in names]
     if not rows:
         return 0
@@ -1433,7 +1489,7 @@ def purge_stale_results(names):
 
     _rewrite_jsonl(results_path, lambda r: (r["variation"], r["test"]) not in stale_keys)
     for variation, test in stale_keys:
-        test_dir = workspace.PROJECT_ROOT / "sim" / variation / test
+        test_dir = workspace.sim_root() / variation / test
         if test_dir.is_dir():
             shutil.rmtree(test_dir)
     return len(stale_keys)
@@ -1449,7 +1505,7 @@ def purge_aux_outputs(names):
     (files removed, bytes freed)."""
     removed = freed = 0
     for name in names:
-        sim_dir = workspace.PROJECT_ROOT / "sim" / name
+        sim_dir = workspace.sim_root() / name
         if not sim_dir.is_dir():
             continue
         for test_dir in (p for p in sim_dir.iterdir() if p.is_dir()):
@@ -1469,13 +1525,29 @@ def purge_plots(names):
     purge_stale_results(). Returns how many PNG files were removed."""
     removed = 0
     for name in names:
-        sim_dir = workspace.PROJECT_ROOT / "sim" / name
+        sim_dir = workspace.sim_root() / name
         if not sim_dir.exists():
             continue
         for png in sim_dir.glob("*/*.png"):
             png.unlink()
             removed += 1
     return removed
+
+
+def _forget_other_projects_shared_helpers(shared_dir):
+    """Parsers import tb/_shared/ helpers by bare module name
+    (`from parser_common import ...`), resolved through sys.path and cached
+    in sys.modules -- so in a process that has opened another project
+    before (the GUI's Open Folder, a test run), that project's
+    tb/_shared/ entry and its already-imported parser_common would silently
+    win over this one's. Drop both before loading this project's parser."""
+    def _is_other(directory):
+        return Path(directory).parts[-2:] == ("tb", "_shared") and str(directory) != shared_dir
+    sys.path[:] = [p for p in sys.path if not _is_other(p)]
+    for name, module in list(sys.modules.items()):
+        module_file = getattr(module, "__file__", None)
+        if module_file and _is_other(Path(module_file).parent):
+            del sys.modules[name]
 
 
 def load_parser(relpath):
@@ -1492,6 +1564,7 @@ def load_parser(relpath):
     # sys.path at the same time), but this keeps the more-specific location
     # taking precedence if it ever did.
     shared_dir = str(workspace.PROJECT_ROOT / "tb" / "_shared")
+    _forget_other_projects_shared_helpers(shared_dir)
     if shared_dir not in sys.path:
         sys.path.append(shared_dir)
     spec = importlib.util.spec_from_file_location(module_path.stem, module_path)
@@ -1785,9 +1858,13 @@ def _netlist(container, test_name, tb_source, conditions, tb_params_base,
     # otherwise), so XSCHEM_LIBRARY_PATH's :$env(PWD) entry -- and hence
     # every "sch/<name>" reference -- resolves from the RIGHT tree.
     rcfile_dir = container_rcfile.rsplit("/", 1)[0]
+    # DISPLAY: the docker image's Xvnc (:1); in host mode whatever display
+    # this machine has, or none -- xschem -x only netlists (see
+    # executor.HostExecutor).
+    display = f"export DISPLAY={ctx.display}; " if ctx.display else ""
     netlist_cmd = (
-        f'cd "{rcfile_dir}" && export DISPLAY=:1; '
-        f'/usr/local/share/xschem/bin/xschem --rcfile "{container_rcfile}" '
+        f'cd "{rcfile_dir}" && {display}'
+        f'"{ctx.xschem}" --rcfile "{container_rcfile}" '
         f'-n -x -q -o "{container_run_dir}" "{container_run_dir}/{tb_source.name}"'
     )
     netlist_path = run_dir / f"{tb_source.stem}.spice"
@@ -2008,7 +2085,7 @@ def _run_one_ngspice_attempt(container, test_name, tb_source, conditions, tb_par
     # own exit code as the exec's.
     sim_cmd = (
         f'cd "{container_run_dir}" && export OMP_NUM_THREADS={n_threads}; '
-        f'timeout {sim_timeout} ngspice -b {tb_source.stem}.spice'
+        f'timeout {sim_timeout} "{ctx.ngspice}" -b {tb_source.stem}.spice'
     )
     if aux["write"] or aux["wrdata"]:
         keep_back = "true" if _keep_aux_outputs() else '[ "$rc" -ne 0 ]'
@@ -2173,7 +2250,7 @@ def run_one_xyce(container, test_name, tb_source, conditions, tb_params_base,
     # a future build ever links a threaded BLAS underneath it.
     sim_cmd = (
         f'cd "{container_run_dir}" && export OMP_NUM_THREADS={n_threads}; '
-        f'timeout {sim_timeout} Xyce {plugin_flag}{tb_source.stem}.spice'
+        f'timeout {sim_timeout} "{ctx.xyce}" {plugin_flag}{tb_source.stem}.spice'
     )
     sim_result = docker_exec(container, sim_cmd, timeout=sim_timeout + 10)
     log_text = sim_result.stdout + "\n" + sim_result.stderr
@@ -2347,7 +2424,7 @@ def run_one_openems(container, test_name, tb_source, conditions, tb_params_base,
     geometry = generator.geometry_from_params(tb_params_base)
 
     cache_key = hashlib.sha1(json.dumps(geometry, sort_keys=True).encode()).hexdigest()[:16]
-    cache_dir = workspace.PROJECT_ROOT / "sim" / "_generator_cache" / block / topology
+    cache_dir = workspace.sim_root() / "_generator_cache" / block / topology
     cache_file = cache_dir / f"{cache_key}.json"
     cache_field_png = cache_dir / f"{cache_key}__field.png"
     data_file = run_dir / f"{test_name}_0.json"
@@ -2388,7 +2465,7 @@ def run_one_openems(container, test_name, tb_source, conditions, tb_params_base,
     runner_src = Path(__file__).with_name("openems_generator_runner.py")
     (run_dir / "openems_generator_runner.py").write_bytes(runner_src.read_bytes())
     container_runner_py = f"{container_run_dir}/openems_generator_runner.py"
-    container_generator_py = f"{workspace.container_project_root()}/{block_cfg['generator']}"
+    container_generator_py = workspace.exec_path(workspace.PROJECT_ROOT / block_cfg["generator"])
     container_geometry_json = f"{container_run_dir}/geometry.json"
     container_params_json = f"{container_run_dir}/fitted.params.json"
     container_cache_json = f"{container_run_dir}/result.json"
@@ -2490,7 +2567,7 @@ THREAD_POLICY = {
 
 def run_test(container, variation, test_name, test_cfg, defaults, ctx,
              sim_dir, container_sim_dir, container_rcfile, block_params=None,
-             block_cfg=None, block=None, topology=None):
+             block_cfg=None, block=None, topology=None, where=None):
     simulator = test_cfg.get("simulator", "ngspice")
     runner = SIMULATOR_RUNNERS.get(simulator)
     if runner is None:
@@ -2583,6 +2660,16 @@ def run_test(container, variation, test_name, test_cfg, defaults, ctx,
     # small test never pays ThreadPoolExecutor overhead for workers it will
     # never use.
     all_conditions = list(condition_matrix(test_cfg, defaults, sweep_axis))
+    if where:
+        # Only the conditions matching every {axis: value} in `where` (an
+        # axis a condition doesn't have is no constraint) -- see
+        # run_variation()'s where.
+        all_conditions = [
+            c for c in all_conditions
+            if all(str(c[k]) == str(v) for k, v in where.items() if k in c)
+        ]
+        if not all_conditions:
+            return {"status": "error", "error": f"no condition matches {where}"}
     outcomes = []
     if len(all_conditions) <= 1:
         outcomes = [_run_one_condition(c) for c in all_conditions]
@@ -2684,7 +2771,7 @@ def generate_plot(variation, test_name, test_cfg, defaults):
     sweep_axis = internal_sweep_axis(test_cfg, tb_text)
     simulator = test_cfg.get("simulator", "ngspice")
 
-    test_dir = workspace.PROJECT_ROOT / "sim" / variation / test_name
+    test_dir = workspace.sim_root() / variation / test_name
     parser_module = load_parser(test_cfg["parser"])
     runs = []
     for conditions in condition_matrix(test_cfg, defaults, sweep_axis):
@@ -2752,8 +2839,31 @@ def print_metrics(test_name, metrics, note="", log_prefix=""):
 
 ContainerCtx = collections.namedtuple(
     "ContainerCtx",
-    "container pdk_name models_dir stdcell_dir spiceinit_text xyce_models_dir xyce_plugins_dir mos_corner_section",
+    "container pdk_name models_dir stdcell_dir spiceinit_text xyce_models_dir xyce_plugins_dir mos_corner_section "
+    "xschem ngspice xyce display",
+    # Tool paths as resolved by _resolve_tools(); defaults are what the
+    # docker image has on its login-shell PATH (and its Xvnc display).
+    defaults=("/usr/local/share/xschem/bin/xschem", "ngspice", "Xyce", ":1"),
 )
+
+# $XSCHEM/$NGSPICE/$XYCE override the binaries in either execution mode
+# (the standalone runner's --xschem/--ngspice/--xyce set them); otherwise
+# whatever the executor's PATH has, falling back to the docker image's
+# xschem install dir, which isn't on a non-login PATH.
+_TOOLS_SCRIPT = (
+    'echo "${XSCHEM:-$(command -v xschem || echo /usr/local/share/xschem/bin/xschem)}"; '
+    'echo "${NGSPICE:-$(command -v ngspice || echo ngspice)}"; '
+    'echo "${XYCE:-$(command -v Xyce || echo Xyce)}"'
+)
+
+
+def _resolve_tools(container):
+    lines = docker_exec(container, _TOOLS_SCRIPT).stdout.split("\n")
+    xschem, ngspice, xyce = (lines + ["", "", ""])[:3]
+    return {
+        "xschem": xschem or "xschem", "ngspice": ngspice or "ngspice", "xyce": xyce or "Xyce",
+        "display": getattr(container, "display", ":1"),
+    }
 
 
 def setup_container(container):
@@ -2765,6 +2875,10 @@ def setup_container(container):
     SIMULATOR_RUNNERS entry gets the whole thing rather than one field at a
     time, so adding a 4th simulator later doesn't mean touching every call
     site's positional signature again (it did, twice, for xyce)."""
+    return _setup_container(container)._replace(**_resolve_tools(container))
+
+
+def _setup_container(container):
     ensure_xschemrc(container)
     pdk_name = get_pdk_name(container)
 
@@ -2845,7 +2959,7 @@ def _resolve_container_ctx(container_ctx):
     if container_ctx is not None:
         yield container_ctx
         return
-    with managed_container() as container:
+    with managed_executor() as container:
         yield setup_container(container)
 
 
@@ -2922,13 +3036,11 @@ def materialize_variation_shadow(sim_dir, block_cfg, params, block=None):
     check_unresolved(materialized, materialized_name)
     (sch_dir / materialized_name).write_text(materialized, encoding="utf-8")
 
-    shutil.copyfile(workspace.PROJECT_ROOT / "xschemrc", src_dir / "xschemrc")
-
-    container_sim_dir = f"{workspace.container_project_root()}/sim/{sim_dir.name}"
-    return f"{container_sim_dir}/_src/xschemrc"
+    shutil.copyfile(project_xschemrc(), src_dir / "xschemrc")
+    return workspace.exec_path(src_dir / "xschemrc")
 
 
-def run_variation(block_cfg, tests, defaults, params, force=False, container_ctx=None, origin=None, shadow=False, log_prefix="", block=None, topology=None, skip_on_fail_profile=None, skip_on_fail_max_failures=0, discard_on_fail=False):
+def run_variation(block_cfg, tests, defaults, params, force=False, container_ctx=None, origin=None, shadow=False, log_prefix="", block=None, topology=None, skip_on_fail_profile=None, skip_on_fail_max_failures=0, discard_on_fail=False, where=None):
     """Materialize + simulate one (block, topology, params) variation --
     block/topology default to whichever workspace.open_folder() resolved
     (workspace.BLOCK/workspace.TOPOLOGY), unchanged for every existing
@@ -3004,7 +3116,14 @@ def run_variation(block_cfg, tests, defaults, params, force=False, container_ctx
     which trims immediately since nothing else could be writing
     concurrently there).
 
-    Returns {"variation": name, "any_error": bool, "discard": bool}
+    where ({condition axis: value}, default None) simulates only the matching
+    conditions of each test (see run_test()) -- a quick partial check. Such a
+    run covers only part of a test's condition grid, so its metrics are
+    printed and returned but never appended to results.jsonl.
+
+    Returns {"variation": name, "any_error": bool, "discard": bool,
+    "tests": {test: {"status": "fresh"|"success"|"partial"|"error",
+    "metrics": [...]} or {"status": "error", "error": str}}}
     ("discard" is always present, False unless this call's own early exit
     just happened with discard_on_fail=True)."""
     block = block or workspace.BLOCK
@@ -3018,6 +3137,7 @@ def run_variation(block_cfg, tests, defaults, params, force=False, container_ctx
     print(f"variation: {name}")
     any_error = False
     discard = False
+    tests_out = {}
 
     # Seeded here (rather than starting empty) so a skip_on_fail_profile
     # constraint referencing an already-fresh/cached test's metric is
@@ -3044,18 +3164,22 @@ def run_variation(block_cfg, tests, defaults, params, force=False, container_ctx
             }
             for r in rows
         ], note=" (SKIPPED, fresh result already in sim/results.jsonl)", log_prefix=log_prefix)
+        tests_out[test_name] = {"status": "fresh", "metrics": [
+            {"name": r["metric"], **{k: r.get(k) for k in ("typical", "min", "max", "mean", "std", "unit")}}
+            for r in rows
+        ]}
 
     if not to_run:
-        return {"variation": name, "any_error": any_error, "discard": discard}
+        return {"variation": name, "any_error": any_error, "discard": discard, "tests": tests_out}
 
     # Real work starts here (materialize + simulate) -- see
     # emit_progress_variation_done's own docstring for why elapsed time is
     # tracked from here, per variation, rather than as one global indicator.
     start_ts = time.monotonic()
 
-    sim_dir = workspace.PROJECT_ROOT / "sim" / name
+    sim_dir = workspace.sim_root() / name
     sim_dir.mkdir(parents=True, exist_ok=True)
-    container_sim_dir = f"{workspace.container_project_root()}/sim/{name}"
+    container_sim_dir = workspace.exec_path(sim_dir)
 
     # See _HIERARCHICAL_MATERIALIZE_LOCK's own comment for the history here:
     # materialize_sub_blocks() USED TO always materialize into shared,
@@ -3090,12 +3214,12 @@ def run_variation(block_cfg, tests, defaults, params, force=False, container_ctx
                 materialized = substitute_params(topology_sch.read_text(encoding="utf-8"), resolve_materialization_params(block_cfg, params))
                 check_unresolved(materialized, materialized_name)
                 (workspace.PROJECT_ROOT / "sch" / materialized_name).write_text(materialized, encoding="utf-8")
-                container_rcfile = f"{workspace.container_project_root()}/xschemrc"
+                container_rcfile = workspace.exec_path(project_xschemrc())
         except StaleParameterSchema as exc:
             print(f"{log_prefix}{name}: SKIPPED (pre-migration parameter schema, see {exc})")
             emit_progress_skipped(name, list(to_run))
             emit_progress_variation_done(name, time.monotonic() - start_ts, any_error)
-            return {"variation": name, "any_error": any_error, "discard": discard}
+            return {"variation": name, "any_error": any_error, "discard": discard, "tests": tests_out}
 
         git_commit, git_dirty = git_info()
         # A list, not the plain dict-items() iteration this used to be, so a
@@ -3125,19 +3249,24 @@ def run_variation(block_cfg, tests, defaults, params, force=False, container_ctx
                 result = run_test(
                     ctx.container, name, test_name, test_cfg, defaults, ctx,
                     sim_dir, container_sim_dir, container_rcfile,
-                    block_params=params, block_cfg=block_cfg, block=block, topology=topology,
+                    block_params=params, block_cfg=block_cfg, block=block, topology=topology, where=where,
                 )
                 test_elapsed = time.monotonic() - test_start_ts
                 if result["status"] == "error":
                     print(f"{log_prefix}  {test_name}: ERROR ({result['error']})")
                     emit_progress_testfail(name, test_name)
+                    tests_out[test_name] = {"status": "error", "error": result["error"]}
                     any_error = True
                     continue
-                append_results(
-                    name, block, topology, test_name, definition_hashes[test_name], result["result"],
-                    git_commit, git_dirty, duration_seconds=test_elapsed,
-                )
+                tests_out[test_name] = {"status": result["status"], "metrics": result["result"]}
+                if not where:
+                    append_results(
+                        name, block, topology, test_name, definition_hashes[test_name], result["result"],
+                        git_commit, git_dirty, duration_seconds=test_elapsed,
+                    )
                 note = f" (some conditions failed to simulate, see sim/{name}/runs.jsonl)" if result["status"] == "partial" else ""
+                if where:
+                    note += f" (only conditions matching {where}; not recorded)"
                 print_metrics(test_name, result["result"], note, log_prefix=log_prefix)
                 accumulated_metrics.extend(
                     {
@@ -3171,11 +3300,11 @@ def run_variation(block_cfg, tests, defaults, params, force=False, container_ctx
                     break
 
     emit_progress_variation_done(name, time.monotonic() - start_ts, any_error)
-    return {"variation": name, "any_error": any_error, "discard": discard}
+    return {"variation": name, "any_error": any_error, "discard": discard, "tests": tests_out}
 
 
 def _variation_params(name):
-    for row in _read_jsonl(workspace.PROJECT_ROOT / "sim" / "variations.jsonl"):
+    for row in _read_jsonl(workspace.sim_root() / "variations.jsonl"):
         if row["name"] == name:
             return row["parameters"]
     sys.exit(f"no such variation in sim/variations.jsonl: {name!r}")
@@ -3271,8 +3400,14 @@ def main():
     )
     arg_parser.add_argument("--block", default=None, help="block to operate on; defaults to the first declared in config.json")
     arg_parser.add_argument("--topology", default=None, help="topology to operate on; defaults to the first declared for --block")
+    arg_parser.add_argument(
+        "--execution", choices=("docker", "host"), default=None,
+        help="where simulators run: a docker container of the project's image, or this machine's own "
+             "tools (default: settings.json execution.mode, see the GUI's Simulation Settings)",
+    )
     args = arg_parser.parse_args()
 
+    workspace.set_overrides(mode=args.execution)
     workspace.open_folder(args.project_root, block=args.block, topology=args.topology)
     validate_skip_on_fail_profile(args.skip_on_fail)
     validate_skip_on_fail_tolerance(args.skip_on_fail, args.skip_on_fail_max_failures, args.discard_on_fail)

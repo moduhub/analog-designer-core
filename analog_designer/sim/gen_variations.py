@@ -22,15 +22,21 @@ import sys
 import time
 import traceback
 
+from analog_designer.core import console
+from analog_designer.core import console
 from analog_designer.core import workspace
 from analog_designer.sim.run_sim import (
     BLOCK_REF_DEFAULT, _read_jsonl, emit_progress_plan, emit_progress_trimmed,
     emit_progress_variation_done, ensure_variation_registered, historical_test_durations,
-    load_results, managed_container, plan_progress, run_variation,
+    load_results, managed_executor, plan_progress, run_variation,
     setup_container, trim_variation, validate_skip_on_fail_profile, validate_skip_on_fail_tolerance,
     variation_name,
 )
 from analog_designer.sim.spice_value import _match, format_spice_value, parse_spice_value
+
+print = console.atomic_print  # worker threads share stdout, see core/console.py
+
+print = console.atomic_print  # worker threads share stdout, see core/console.py
 
 
 def _grid_value(pdef):
@@ -260,7 +266,7 @@ def _run_batch(param_sets, block_cfg, tests, defaults, force, origin, skip_on_fa
         checkpoint_size = max(1, DEFAULT_CHECKPOINT_MULTIPLIER * max_workers)
     elif not discard_on_fail:
         checkpoint_size = None
-    existing_names = {r["name"] for r in _read_jsonl(workspace.PROJECT_ROOT / "sim" / "variations.jsonl")}
+    existing_names = {r["name"] for r in _read_jsonl(workspace.sim_root() / "variations.jsonl")}
     any_error = False
 
     # Progress plan for the WHOLE batch, computed up front (pure file
@@ -337,7 +343,7 @@ def _run_batch(param_sets, block_cfg, tests, defaults, force, origin, skip_on_fa
         emit_progress_trimmed(to_discard)
         to_discard = failed
 
-    with managed_container() as container:
+    with managed_executor() as container:
         container_ctx = setup_container(container)
         if max_workers <= 1:
             for i, params in enumerate(param_sets):
@@ -511,7 +517,7 @@ def _run_hierarchical_batch(jobs, defaults, force, skip_on_fail_profile=None,
         checkpoint_size = max(1, DEFAULT_CHECKPOINT_MULTIPLIER * max_workers)
     elif not discard_on_fail:
         checkpoint_size = None
-    existing_names = {r["name"] for r in _read_jsonl(workspace.PROJECT_ROOT / "sim" / "variations.jsonl")}
+    existing_names = {r["name"] for r in _read_jsonl(workspace.sim_root() / "variations.jsonl")}
     any_error = False
 
     existing_results = load_results()
@@ -597,7 +603,7 @@ def _run_hierarchical_batch(jobs, defaults, force, skip_on_fail_profile=None,
         if checkpoint_size else [groups]
     )
 
-    with managed_container() as container:
+    with managed_executor() as container:
         container_ctx = setup_container(container)
         offset = 0
         for chunk_groups in chunks:

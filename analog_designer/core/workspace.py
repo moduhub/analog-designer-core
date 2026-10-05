@@ -8,6 +8,7 @@ different folder later (e.g. a GUI "Open Folder" action).
 """
 import contextlib
 import json
+import os
 import threading
 from pathlib import Path
 
@@ -20,6 +21,15 @@ CONFIG = None
 BLOCK = None
 TOPOLOGY = None
 _CORE_POOL = None
+
+#: Process-wide overrides of the machine-level settings.py values, set by a
+#: caller that knows better than settings.json for this one run -- the
+#: standalone runner (analog_designer/standalone/cli.py) and the CLIs'
+#: --execution flag. Keys: "mode", "pdk_root", "pdk", "cpu_budget",
+#: "sim_root" (a Path: where sim/ output goes instead of PROJECT_ROOT/sim)
+#: and "read_only" (True: never write into the project tree outside
+#: sim_root -- see run_sim.ensure_xschemrc()). Cleared by reset_overrides().
+_OVERRIDES = {}
 
 
 def _remembered_folder():
@@ -35,7 +45,21 @@ def _remember_folder(path):
     _LAST_FOLDER_FILE.write_text(str(path), encoding="utf-8")
 
 
-def open_folder(path=None, block=None, topology=None):
+def set_overrides(**overrides):
+    """See _OVERRIDES. A None value is ignored (so argparse defaults can be
+    passed straight through)."""
+    global _CORE_POOL
+    _OVERRIDES.update({k: v for k, v in overrides.items() if v is not None})
+    _CORE_POOL = None
+
+
+def reset_overrides():
+    global _CORE_POOL
+    _OVERRIDES.clear()
+    _CORE_POOL = None
+
+
+def open_folder(path=None, block=None, topology=None, remember=True):
     """Resolve and set the work folder: explicit path arg -> remembered last
     folder -> CWD. Loads config.json from it and resolves BLOCK/TOPOLOGY:
     explicit args, else the first block/topology declared in config.json.
@@ -51,7 +75,8 @@ def open_folder(path=None, block=None, topology=None):
     PROJECT_ROOT = root
     CONFIG = json.loads(config_path.read_text(encoding="utf-8"))
     resolve_parameters_files(root, CONFIG)
-    _remember_folder(root)
+    if remember:
+        _remember_folder(root)
     _CORE_POOL = None  # re-sized lazily from the CURRENT cpu_budget() on next core_pool() call
 
     blocks = CONFIG.get("blocks", {})
@@ -105,16 +130,69 @@ def container_image():
     return CONFIG.get("container", {}).get("image", global_default)
 
 
+def execution_mode():
+    """"docker" or "host" -- where simulators run (see
+    analog_designer/core/executor.py): an override (set_overrides(mode=...)),
+    else $ANALOG_DESIGNER_EXECUTION, else settings.json's execution.mode."""
+    mode = _OVERRIDES.get("mode") or os.environ.get("ANALOG_DESIGNER_EXECUTION") or settings.load()["execution"]["mode"]
+    if mode not in settings.EXECUTION_MODES:
+        raise ValueError(f"execution mode must be one of {settings.EXECUTION_MODES}, got {mode!r}")
+    return mode
+
+
+def host_pdk():
+    """(pdk_root, pdk) for host mode: overrides, else settings.json's host
+    section, else $PDK_ROOT/$PDK; the PDK name finally falls back to the
+    tag of the project's container.image (e.g. "eda-env-designer:ihp-sg13cmos5l"
+    -> "ihp-sg13cmos5l"), which is what the docker images bake in as $PDK."""
+    host = settings.load()["host"]
+    pdk_root = _OVERRIDES.get("pdk_root") or host.get("pdk_root") or os.environ.get("PDK_ROOT", "")
+    pdk = _OVERRIDES.get("pdk") or host.get("pdk") or os.environ.get("PDK", "")
+    if not pdk and CONFIG is not None:
+        image = container_image()
+        pdk = image.rsplit(":", 1)[1] if ":" in image else ""
+    return pdk_root, pdk
+
+
+def sim_root():
+    """Where simulation output lives: PROJECT_ROOT/sim, unless overridden
+    (the standalone runner's --dry points it at a temporary directory)."""
+    return Path(_OVERRIDES.get("sim_root") or PROJECT_ROOT / "sim")
+
+
+def read_only_project():
+    """True when nothing may be written into the project tree outside
+    sim_root() (the standalone runner's --dry)."""
+    return bool(_OVERRIDES.get("read_only"))
+
+
 def container_project_root():
-    """The container mounts the host's project directories under a template
-    path, keyed by the host folder's name -- e.g.
-    '/home/moduhub/work/{name}'. Sourced from global settings.py's
-    container.project_root_template, overridable per-project via
-    config.json's own container.project_root_template if a project's mount
-    layout differs."""
+    """Where the project folder is, as seen by the simulators. In docker
+    mode the container mounts the host's project directory under a template
+    path keyed by the host folder's name -- e.g. '/home/moduhub/work/{name}',
+    from global settings.py's container.project_root_template, overridable
+    per-project via config.json's own container.project_root_template if a
+    project's mount layout differs. In host mode it's simply PROJECT_ROOT."""
+    if execution_mode() == "host":
+        return PROJECT_ROOT.as_posix()
     global_default = settings.load()["container"]["project_root_template"]
     template = CONFIG.get("container", {}).get("project_root_template", global_default)
     return template.format(name=PROJECT_ROOT.name)
+
+
+def exec_path(path):
+    """A host path (under PROJECT_ROOT) as the simulators see it -- the
+    single place host->container path mapping happens. Host mode: the path
+    itself. Docker mode: only paths under PROJECT_ROOT are mounted, so
+    anything else is an error rather than a silently wrong path."""
+    path = Path(path)
+    if execution_mode() == "host":
+        return path.as_posix()
+    try:
+        relative = path.resolve().relative_to(PROJECT_ROOT)
+    except ValueError:
+        raise ValueError(f"{path} is outside the project folder, so the docker container can't see it") from None
+    return f"{container_project_root()}/{relative.as_posix()}" if relative.parts else container_project_root()
 
 
 def cpu_budget():
@@ -126,7 +204,7 @@ def cpu_budget():
     thread count to whatever's actually free, instead of needing a small
     job-COUNT ceiling to avoid oversubscription the way the older
     max_parallel (a variation count, not a core count) did."""
-    return settings.load()["container"]["cpu_budget"]
+    return _OVERRIDES.get("cpu_budget") or settings.load()["container"]["cpu_budget"]
 
 
 class CpuBudget:
