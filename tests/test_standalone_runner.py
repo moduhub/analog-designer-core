@@ -432,6 +432,114 @@ class ProjectSwitchTests(_FixtureCase):
         self.assertEqual(run_sim.load_parser("tb/core/tb_level.py").extract(data), {"value": 2.5})
 
 
+class SummaryAndFiguresTests(unittest.TestCase):
+    """The end-of-run reporting: pure formatting plus make_plots() with
+    run_sim.generate_plot mocked (no simulator, no matplotlib, any OS)."""
+
+    OUTCOME = {
+        "variation": "blk-a-123456", "any_error": True, "discard": False,
+        "tests": {
+            "level": {"status": "success", "metrics": [
+                {"name": "Level", "typical": 1.025, "min": 0.9, "max": 1.2345678, "unit": "V"}]},
+            "mc": {"status": "partial", "metrics": [
+                {"name": "Offset", "typical": None, "mean": 0.001, "std": 0.0002, "min": -0.01, "max": None,
+                 "unit": "V"}]},
+            "old": {"status": "fresh", "metrics": []},
+            "bad": {"status": "error", "error": "\nsimulation blew up\nsecond line"},
+        },
+    }
+
+    def test_summary_lists_metrics_notes_and_first_error_line(self):
+        text = cli.format_summary(self.OUTCOME)
+        self.assertEqual(text.splitlines(), [
+            "summary: blk-a-123456",
+            "  level",
+            "    Level: 1.025 V [0.9 .. 1.23457]",
+            "  mc (some conditions failed)",
+            "    Offset: 0.001 +- 0.0002 V [-0.01 .. -]",
+            "  old (stored result, not rerun)",
+            "  bad: ERROR simulation blew up",
+        ])
+
+    def _make_plots(self, generate):
+        args = mock.Mock(no_plots=False, dry=False, where=[])
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            def fake_generate(variation, test, test_cfg, defaults):
+                return generate(root / "sim" / variation / test, test)
+
+            patches = [
+                mock.patch.object(workspace, "PROJECT_ROOT", root),
+                mock.patch.object(workspace, "BLOCK", "blk"),
+                mock.patch.object(workspace, "CONFIG", {"defaults": {}, "tests": {"blk": {t: {} for t in self.OUTCOME["tests"]}}}),
+                mock.patch.object(run_sim, "generate_plot", side_effect=fake_generate),
+            ]
+            for p in patches:
+                p.start()
+            try:
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    cli.make_plots(args, self.OUTCOME)
+            finally:
+                for p in reversed(patches):
+                    p.stop()
+        return out.getvalue()
+
+    def test_figures_are_listed_relative_to_the_project_and_errors_skipped(self):
+        called = []
+
+        def generate(test_dir, test):
+            called.append(test)
+            test_dir.mkdir(parents=True)
+            (test_dir / f"{test}__all.png").write_bytes(b"png")
+            return True
+
+        out = self._make_plots(generate)
+        self.assertEqual(called, ["level", "mc", "old"])  # the errored test has nothing to draw
+        self.assertEqual(out.splitlines(), [
+            "figures:",
+            "  sim/blk-a-123456/level/level__all.png",
+            "  sim/blk-a-123456/mc/mc__all.png",
+            "  sim/blk-a-123456/old/old__all.png",
+        ])
+
+    def test_a_failing_parser_is_reported_and_the_rest_still_drawn(self):
+        def generate(test_dir, test):
+            if test == "level":
+                raise ValueError("bad data")
+            test_dir.mkdir(parents=True)
+            (test_dir / f"{test}.png").write_bytes(b"png")
+            return True
+
+        out = self._make_plots(generate)
+        self.assertIn("figures: level failed (ValueError: bad data)", out)
+        self.assertIn("  sim/blk-a-123456/mc/mc.png", out)
+
+    def test_missing_matplotlib_is_one_line_not_a_crash(self):
+        def generate(test_dir, test):
+            raise ImportError("No module named 'matplotlib'")
+
+        out = self._make_plots(generate)
+        self.assertEqual(out.strip(), "figures: skipped, No module named 'matplotlib'")
+
+    def test_nothing_is_drawn_for_dry_where_or_no_plots(self):
+        def generate(test_dir, test):
+            raise AssertionError("must not be called")
+
+        for flags, expect in (({"dry": True}, "--dry"), ({"where": ["corner=tt"]}, "--where"), ({"no_plots": True}, None)):
+            args = mock.Mock(no_plots=False, dry=False, where=[])
+            for key, value in flags.items():
+                setattr(args, key, value)
+            out = io.StringIO()
+            with mock.patch.object(run_sim, "generate_plot", side_effect=generate), contextlib.redirect_stdout(out):
+                cli.make_plots(args, self.OUTCOME)
+            if expect:
+                self.assertIn(expect, out.getvalue())
+            else:
+                self.assertEqual(out.getvalue(), "")
+
+
 class BundleTests(_FixtureCase):
     def test_bundle_covers_the_pipeline_and_nothing_gui(self):
         files = export.bundled_files()

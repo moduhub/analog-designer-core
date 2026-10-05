@@ -13,6 +13,10 @@ module only maps flags onto it:
     reads, fresh tests skipped) or, with --dry, a temporary directory --
     the project tree is then only read (materialization always goes to the
     per-variation shadow sim/<variation>/_src/, never to sch/);
+  * what it reports: each test's metrics as it finishes, a summary of all of
+    them at the end, and the figures (the GUI's sim/<variation>/<test>/*.png,
+    listed on the console; --no-plots skips them). Interactive viewing is the
+    GUI's job;
   * what runs: --test, --where (a subset of conditions, never recorded),
     --variation/--param, --import-metric.
 """
@@ -155,6 +159,68 @@ def run(args):
             ) from None
 
 
+def _num(value):
+    return "-" if value is None else f"{value:.6g}"
+
+
+def format_summary(outcome):
+    """The end-of-run recap: one block per test with each metric's typical
+    value and range (mean +- std for a Monte Carlo metric), or the first line
+    of its error. The same numbers the run printed as each test finished,
+    gathered after the simulator chatter."""
+    lines = [f"summary: {outcome['variation']}"]
+    for test, result in outcome["tests"].items():
+        status = result["status"]
+        if status == "error":
+            reason = next((l.strip() for l in str(result.get("error", "")).splitlines() if l.strip()), "")
+            lines.append(f"  {test}: ERROR {reason}")
+            continue
+        note = {"fresh": " (stored result, not rerun)", "partial": " (some conditions failed)"}.get(status, "")
+        lines.append(f"  {test}{note}")
+        for m in result["metrics"]:
+            central = f"{_num(m.get('mean'))} +- {_num(m.get('std'))}" if m["typical"] is None else _num(m["typical"])
+            lines.append(f"    {m['name']}: {central} {m.get('unit', '')} [{_num(m['min'])} .. {_num(m['max'])}]")
+    return "\n".join(lines)
+
+
+def make_plots(args, outcome):
+    """Writes each test's figures next to its results, sim/<variation>/<test>/
+    (the files the GUI shows), and lists them. The run never fails because of
+    a figure: a parser's plotting error or a missing matplotlib is reported
+    and skipped. Nothing is drawn for --dry (it writes nothing) or --where
+    (a subset of conditions) -- the console says so."""
+    if args.no_plots:
+        return
+    if args.dry or args.where:
+        print(f"figures: not generated with {'--dry' if args.dry else '--where'} "
+              f"({'nothing is written' if args.dry else 'partial run'}); run without it to get them in sim/")
+        return
+    config, block = workspace.CONFIG, workspace.BLOCK
+    variation = outcome["variation"]
+    written = []
+    for test, result in outcome["tests"].items():
+        if result["status"] == "error":
+            continue
+        try:
+            made = run_sim.generate_plot(variation, test, config["tests"][block][test], config["defaults"])
+        except ImportError as exc:
+            print(f"figures: skipped, {exc}")
+            return
+        except Exception as exc:
+            print(f"figures: {test} failed ({type(exc).__name__}: {exc})")
+            continue
+        if made:
+            written += sorted((workspace.sim_root() / variation / test).glob(f"{test}*.png"))
+    if written:
+        print("figures:")
+        for path in written:
+            try:
+                path = path.relative_to(workspace.PROJECT_ROOT)
+            except ValueError:
+                pass
+            print(f"  {path.as_posix()}")
+
+
 def build_parser():
     ap = argparse.ArgumentParser(
         prog="run_tb.py", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -174,6 +240,8 @@ def build_parser():
     ap.add_argument("--keep", action="store_true", help="with --dry: keep the temporary directory and print it")
     ap.add_argument("--force", action="store_true", help="rerun tests whose stored result is still fresh")
     ap.add_argument("--json", help="write a JSON summary of the results here")
+    ap.add_argument("--no-plots", action="store_true",
+                    help="skip the figures (default: written to sim/<variation>/<test>/ and listed at the end)")
     ap.add_argument("--jobs", type=int, default=None, help="CPU cores to use (default: all)")
     ap.add_argument("--keep-aux", action="store_true", help="keep auxiliary simulator outputs (.raw etc.)")
     ap.add_argument("--execution", choices=("host", "docker"), default="host",
@@ -234,6 +302,8 @@ def main(argv=None):
 
         start = time.monotonic()
         outcome = run(args)
+        print(f"\n{format_summary(outcome)}")
+        make_plots(args, outcome)
         print(f"\ndone in {time.monotonic() - start:.1f}s" + ("  (with errors)" if outcome["any_error"] else ""))
         if args.json:
             Path(args.json).write_text(json.dumps(outcome, indent=2, default=str) + "\n", encoding="utf-8")
