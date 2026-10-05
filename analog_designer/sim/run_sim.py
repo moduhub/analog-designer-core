@@ -52,7 +52,6 @@ from pathlib import Path
 
 from analog_designer.core import executor as executors
 from analog_designer.core import console
-from analog_designer.core import console
 from analog_designer.core import workspace
 from analog_designer.results import fom
 from analog_designer.sim import log_diagnostics
@@ -60,8 +59,6 @@ from analog_designer.sim import raw_peaks
 from analog_designer.sim import soa_check
 from analog_designer.sim import spice_devices
 from analog_designer.sim.spice_value import _match, format_spice_value, parse_spice_value
-
-print = console.atomic_print  # worker threads share stdout, see core/console.py
 
 print = console.atomic_print  # worker threads share stdout, see core/console.py
 

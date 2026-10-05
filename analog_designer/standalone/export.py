@@ -125,7 +125,10 @@ def bundled_files():
 def bundle_hash(files=None):
     digest = hashlib.sha256()
     for rel in files or bundled_files():
-        digest.update(rel.encode() + b"\0" + (SOURCE_ROOT / rel).read_bytes() + b"\0")
+        # CRLF-normalized: a Windows checkout (autocrlf) must hash like the Linux
+        # one, or the GUI would see every runner generated on the other OS as stale.
+        content = (SOURCE_ROOT / rel).read_bytes().replace(b"\r\n", b"\n")
+        digest.update(rel.encode() + b"\0" + content + b"\0")
     return digest.hexdigest()[:16]
 
 

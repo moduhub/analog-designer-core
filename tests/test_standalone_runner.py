@@ -300,6 +300,12 @@ class ExecutionSettingsTests(_FixtureCase):
         self.assertEqual(loaded["container"]["cpu_budget"], 3)
 
 
+#: Host mode and the generated runner need a POSIX bash; on Windows
+#: Popen(["bash"]) finds the WSL launcher in System32 first.
+needs_posix_bash = unittest.skipIf(os.name == "nt", "needs a POSIX bash")
+
+
+@needs_posix_bash
 class HostExecutorTests(unittest.TestCase):
     def test_runs_bash_in_its_own_directory(self):
         result = executor.HostExecutor().run('cd /tmp && echo "$PWD" && exit 3')
@@ -335,6 +341,7 @@ class HostExecutorTests(unittest.TestCase):
         self.assertEqual(run_sim.docker_exec(executor.HostExecutor(), "echo hi").stdout, "hi\n")
 
 
+@needs_posix_bash
 class StandaloneCliTests(_FixtureCase):
     def test_dry_run_leaves_the_project_untouched(self):
         before = _snapshot(self.root)
@@ -433,6 +440,15 @@ class BundleTests(_FixtureCase):
             self.assertIn(needed, files)
         self.assertFalse([f for f in files if "/gui/" in f])
 
+    def test_bundle_hash_ignores_line_endings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "a.py").write_bytes(b"x = 1\ny = 2\n")
+            with mock.patch.object(export, "SOURCE_ROOT", Path(tmp)):
+                lf = export.bundle_hash(["a.py"])
+                (Path(tmp) / "a.py").write_bytes(b"x = 1\r\ny = 2\r\n")
+                self.assertEqual(export.bundle_hash(["a.py"]), lf)
+
+    @needs_posix_bash
     def test_generated_runner_works_without_this_checkout(self):
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(export.main([str(self.root)]), 0)
