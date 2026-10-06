@@ -1304,6 +1304,19 @@ def emit_progress_testfail(variation, test_name):
         print(f"@PROGRESS TESTFAIL {variation} {test_name}")
 
 
+def emit_progress_openems_job(abort_path):
+    """Printed when a detached openEMS container starts, and again (with an empty path) when it is
+    collected, so analog_designer/gui/run_trigger.py knows where this job's ABORT file goes.
+
+    Unlike every other simulator here, a FDTD run outlives the process that started it ON PURPOSE
+    (see run_one_openems()), so RunTrigger.cancel()'s usual `docker stop` is the wrong tool twice
+    over: it would throw away hours of converging simulation, and it would do so without letting
+    openEMS write its probe data out. Dropping an ABORT file in the run's own directory instead makes
+    openEMS stop cleanly within seconds and still produce a (partial, clearly marked) sweep."""
+    if _progress_enabled():
+        print(f"@PROGRESS OPENEMSJOB {abort_path}")
+
+
 def emit_progress_container(container_id):
     """Printed once, right after managed_container() starts a fresh
     container, so analog_designer/gui/run_trigger.py can learn its id without any IPC
@@ -2314,6 +2327,202 @@ def _strip_xyce_print_header(data_file):
 
 
 _OPENEMS_F_MAX_HZ = 20e9
+
+# How often the host checks on a detached FDTD container: new log lines, container state, ETA. A
+# multi-hour run does not need a tighter loop, and each pass costs a `docker inspect`.
+_OPENEMS_POLL_S = 15
+
+# openEMS's own per-interval progress line, e.g.
+#   [@  2h40m59s] Timestep:  283647 || Speed: 122.9 MC/s (3.336e-02 s/TS) || Energy: ~1.29e-05 (-10.63dB)
+# Note the sign is separated from the number when the value is small ("(- 0.00dB)"), hence the
+# optional whitespace after the minus -- matched against real logs from this project's own runs.
+_OPENEMS_ENERGY_RE = re.compile(r"Timestep:\s*(\d+).*?\(\s*(-?)\s*([0-9.]+)\s*dB\)")
+
+# Name of the file openEMS polls for, in its own working directory, to stop cleanly. Must match
+# openems_generator_runner.ABORT_FILENAME.
+_OPENEMS_ABORT_FILENAME = "ABORT"
+
+# Where a detached run records which container is carrying it, so a later invocation (after a GUI
+# crash, a reboot, or an ordinary cancel) re-attaches to it instead of starting those hours over.
+_OPENEMS_JOB_FILE = "openems_job.json"
+
+
+def _openems_launch_detached(container_name, sim_cmd, n_threads):
+    """Starts the FDTD in a container of its OWN, which deliberately outlives this process.
+
+    Every other simulator here runs inside managed_container()'s shared container, whose lifetime is
+    one script invocation -- correct for runs measured in seconds. A FDTD run is measured in HOURS,
+    and tying it to the GUI's own process means a crashed, killed or closed GUI throws away however
+    much of it had completed. Detached instead, the run survives all three, and the next invocation
+    re-attaches to it (see run_one_openems) rather than starting over.
+
+    Not --rm, unlike managed_container(): the exit code has to still be readable after the container
+    stops, which is the whole point of being able to come back to it later.
+
+    --entrypoint bash is NOT optional. The image's own entrypoint (/home/moduhub/start.sh) never
+    execs its arguments -- it starts a VNC desktop and then blocks on `tail -f /dev/null` -- so
+    passing the command as plain `docker run <image> bash -lc ...` leaves a container that is Up,
+    looks healthy, and silently never runs anything (confirmed: a launch that way produced a live
+    container and no openems_run.log at all). managed_container() does not hit this because it only
+    needs the container ALIVE and then goes in via `docker exec`. Overriding the entrypoint also
+    means no unattended xfce/Xvnc session is started in the first place, so unlike
+    managed_container() there is nothing here for _kill_unused_desktop_session() to clean up."""
+    docker_args = [
+        "docker", "run", "-d", "--name", container_name,
+        "-e", f"OMP_NUM_THREADS={n_threads}",
+        "-v", f"{workspace.PROJECT_ROOT}:{workspace.container_project_root()}",
+        "-w", workspace.container_project_root(),
+        "--entrypoint", "bash", workspace.container_image(), "-lc", sim_cmd,
+    ]
+    result = subprocess.run(docker_args, capture_output=True, text=True)
+    if result.returncode != 0:
+        return None, result.stderr
+    return result.stdout.strip(), ""
+
+
+def _openems_relay_log(log_path, offset, samples, target_db, started_at):
+    """Forwards whatever the detached run has appended to its log since `offset` to this process's
+    own stdout (so the GUI console shows a FDTD run as it happens, instead of a frozen-looking
+    window for hours), collecting energy readings as it goes. Returns the new offset.
+
+    openEMS's own line-buffered output (see the `stdbuf` in sim_cmd) is what makes this possible:
+    the log is on the bind-mounted run directory, so the host can read it while the container
+    writes it."""
+    if not log_path.exists():
+        return offset
+    with log_path.open("r", encoding="utf-8", errors="replace") as fh:
+        fh.seek(offset)
+        chunk = fh.read()
+        offset = fh.tell()
+    for line in chunk.splitlines():
+        if not line.strip():
+            continue
+        # Never let a line from inside the container start with "@PROGRESS": the GUI parses those.
+        print(f"[openems] {line}" if not line.startswith("@") else f"[openems] |{line}")
+        match = _OPENEMS_ENERGY_RE.search(line)
+        if match:
+            db = float(match.group(3)) * (-1 if match.group(2) else 1)
+            samples.append((time.time() - started_at, db))
+    return offset
+
+
+def _openems_status_line(samples, target_db, elapsed):
+    """One human-readable progress line: elapsed, how far the energy has come toward the stop
+    criterion, and the optimistic time bound (see _openems_eta_seconds for why it is only a bound)."""
+    if not samples:
+        return f"[openems] {_fmt_hms(elapsed)} elapsed -- still setting up / no energy reported yet"
+    db = samples[-1][1]
+    pct = max(0.0, min(100.0, 100.0 * db / target_db)) if target_db else 0.0
+    eta = _openems_eta_seconds(samples, target_db)
+    tail = (f"at least {_fmt_hms(eta)} to go (optimistic bound, often 2-4x short)"
+            if eta else "no usable time estimate yet")
+    return (f"[openems] {_fmt_hms(elapsed)} elapsed -- energy {db:.2f}dB of {target_db:.0f}dB "
+            f"({pct:.0f}%) -- {tail}")
+
+
+def _openems_wait(container_name, log_path, target_db, poll_s=_OPENEMS_POLL_S):
+    """Watches a detached FDTD container until it stops, relaying its log and printing a periodic
+    progress line. Returns its exit code, or None if this process was interrupted first -- in which
+    case the container is deliberately LEFT RUNNING, because the whole point of detaching it is that
+    losing this process must not cost the simulation."""
+    started_at = time.time()
+    offset = 0
+    samples = []
+    last_status = 0.0
+    while True:
+        exists, running, exit_code = _openems_container_state(container_name)
+        offset = _openems_relay_log(log_path, offset, samples, target_db, started_at)
+        if not exists:
+            print(f"[openems] container {container_name} disappeared before it finished")
+            return None
+        if not running:
+            _openems_relay_log(log_path, offset, samples, target_db, started_at)
+            print(f"[openems] finished after {_fmt_hms(time.time() - started_at)} "
+                  f"(container exit code {exit_code})")
+            return exit_code
+        now = time.time()
+        if now - last_status >= max(poll_s * 4, 60):
+            print(_openems_status_line(samples, target_db, now - started_at))
+            last_status = now
+        try:
+            time.sleep(poll_s)
+        except KeyboardInterrupt:
+            print(f"[openems] interrupted -- the run CONTINUES in container {container_name}; "
+                  f"start this test again to re-attach to it")
+            raise
+
+
+def _openems_container_state(name):
+    """(exists, running, exit_code) for a container BY NAME. A missing container is (False, False,
+    None) -- `docker inspect` failing is the normal answer here, not an error."""
+    result = subprocess.run(
+        ["docker", "inspect", "-f", "{{.State.Running}} {{.State.ExitCode}}", name],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return False, False, None
+    parts = result.stdout.split()
+    if len(parts) != 2:
+        return True, False, None
+    return True, parts[0] == "true", int(parts[1])
+
+
+def _openems_eta_seconds(samples, target_db):
+    """A LOWER BOUND on the seconds still to go before the energy reaches `target_db`, or None when
+    nothing can be said yet. `samples` is [(wall_seconds, energy_db), ...] scraped from the log.
+
+    Deliberately a bound and not a prediction. Both obvious estimators were replayed against a real
+    18h run's own log (210 energy lines, sim/spiral_diff_n3_v2/differential/run.log in the gf180mcu
+    project) and neither is trustworthy:
+
+      * fitting only the recent third: between -58% and +334% error, swinging wildly
+      * fitting the whole decay (what this does): between -27% and -83% -- always SHORT
+
+    The reason no extrapolation works is visible in that same log: the decay is not a single
+    exponential. It stalls almost completely from 9h11m (-49.38dB) to 14h06m (-50.69dB) -- 1.3dB in
+    five hours -- and then covers the remaining 9.3dB in the four hours after that. Nothing derived
+    from the energy before the stall can anticipate the end of it.
+
+    So the whole-history fit is used precisely BECAUSE its error has a consistent sign: it is the
+    optimistic end of the range, and callers must present it as "at least this long", alongside the
+    one honest progress figure, which is the current energy against the target."""
+    usable = [(t, db) for t, db in samples if db < -0.001]      # pre-decay plateau says nothing
+    if len(usable) < 4:
+        return None
+    t0 = usable[0][0]
+    xs = [t - t0 for t, _ in usable]
+    ys = [db for _, db in usable]
+    n = len(xs)
+    mean_x = sum(xs) / n
+    mean_y = sum(ys) / n
+    denom = sum((x - mean_x) ** 2 for x in xs)
+    if denom <= 0:
+        return None
+    slope = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys)) / denom
+    if slope >= 0:                                              # energy flat or rising: no estimate
+        return None
+    remaining_db = target_db - ys[-1]
+    if remaining_db >= 0:
+        return 0.0
+    return remaining_db / slope
+
+
+def _fmt_hms(seconds):
+    seconds = int(max(0, seconds))
+    h, rem = divmod(seconds, 3600)
+    m, sec = divmod(rem, 60)
+    return f"{h}h{m:02d}m" if h else f"{m}m{sec:02d}s"
+
+
+def _openems_target_db(generator):
+    """The energy level this run stops at, in dB, from the project generator's own END_CRITERIA
+    (openEMS reports it the same way: EndCriteria=1e-6 prints as '-60dB'). Falls back to openEMS's
+    own 1e-5 default for a generator that does not declare one."""
+    end_criteria = getattr(generator, "END_CRITERIA", 1e-5)
+    try:
+        return 10.0 * math.log10(float(end_criteria))
+    except (TypeError, ValueError):
+        return -50.0
 _OPENEMS_N_FREQ = 201
 
 
@@ -2485,6 +2694,8 @@ def run_one_openems(container, test_name, tb_source, conditions, tb_params_base,
     # it's printed, not batched behind libc's own full-buffering default
     # for non-TTY output.
     container_log = f"{container_run_dir}/openems_run.log"
+    container_vtr_dir = f"{container_run_dir}/paraview"
+    container_checkpoint_json = f"{container_run_dir}/result.checkpoint.json"
     sim_cmd = (
         f'mkdir -p "{container_run_dir}" && '
         f'export OMP_NUM_THREADS={n_threads} && '
@@ -2493,25 +2704,92 @@ def run_one_openems(container, test_name, tb_source, conditions, tb_params_base,
         f'--corner tt --f-max {_OPENEMS_F_MAX_HZ} '
         f'--out "{container_params_json}" --cache-out "{container_cache_json}" '
         f'--field-png "{container_field_png}" --field-png-dir "{container_field_png_dir}" '
+        f'--vtr-dir "{container_vtr_dir}" --checkpoint-out "{container_checkpoint_json}" '
         f'> "{container_log}" 2>&1'
     )
-    sim_result = docker_exec(container, sim_cmd, timeout=sim_timeout + 30)
     log_path = run_dir / "openems_run.log"
-    if log_path.exists():
-        log_text = log_path.read_text(encoding="utf-8", errors="replace")
-    else:
-        # Only happens if the command never reached the redirected part at
-        # all (e.g. `mkdir -p` itself failed) -- fall back to whatever
-        # bash's own stdout/stderr captured, and make sure a log file
-        # exists either way so callers never have to special-case this.
-        log_text = sim_result.stdout + "\n" + sim_result.stderr
-        log_path.write_text(log_text, encoding="utf-8")
-
     out_json = run_dir / "result.json"
-    if sim_result.returncode != 0 or not out_json.exists():
+    # openEMS polls for this file in its own working directory and stops cleanly when it appears
+    # (see openems_generator_runner.ABORT_FILENAME) -- sim_path is "<--out stem>_sim", per that
+    # script's own main(). Created eagerly so a cancel arriving before the run has made the
+    # directory still has somewhere to put the file.
+    abort_dir = run_dir / "fitted.params_sim"
+    abort_dir.mkdir(parents=True, exist_ok=True)
+
+    if workspace.execution_mode() == "host":
+        # No docker to detach into. Keep the original blocking behaviour rather than pretending
+        # this mode has crash-survival it does not have.
+        sim_result = docker_exec(container, sim_cmd, timeout=sim_timeout + 30)
+        log_text = (log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists()
+                    else sim_result.stdout + "\n" + sim_result.stderr)
+        if not log_path.exists():
+            log_path.write_text(log_text, encoding="utf-8")
+        exit_code = sim_result.returncode
+    else:
+        container_name = f"ad-openems-{block}-{topology}-{cache_key}"
+        exists, running, exit_code = _openems_container_state(container_name)
+        if exists and running:
+            # A previous invocation started this exact geometry and did not live to collect it --
+            # a GUI crash, a cancel, a reboot of this process. Hours of FDTD are still running in
+            # there; attach instead of starting them again.
+            print(f"[openems] re-attaching to the detached run already in {container_name}")
+        elif exists and not running:
+            print(f"[openems] container {container_name} already finished (exit {exit_code}) -- "
+                  f"collecting its output")
+        else:
+            container_id, launch_err = _openems_launch_detached(container_name, sim_cmd, n_threads)
+            if container_id is None:
+                return {"status": "error", "openems_exit_code": 1,
+                        "error": f"could not start detached openEMS container: {launch_err}",
+                        "diagnostics": []}
+            (run_dir / _OPENEMS_JOB_FILE).write_text(json.dumps({
+                "container": container_name, "container_id": container_id,
+                "cache_key": cache_key, "started": datetime.datetime.now().isoformat(timespec="seconds"),
+            }), encoding="utf-8")
+            print(f"[openems] detached run started in {container_name} -- it survives this process; "
+                  f"re-run this test to re-attach")
+            exists, running = True, True
+
+        emit_progress_openems_job(abort_dir / _OPENEMS_ABORT_FILENAME)
+        try:
+            if running:
+                exit_code = _openems_wait(container_name, log_path, _openems_target_db(generator))
+        finally:
+            emit_progress_openems_job("")
+        log_text = (log_path.read_text(encoding="utf-8", errors="replace")
+                    if log_path.exists() else "")
+        if exit_code is not None:
+            # Collected: the container has nothing left to carry. Its outputs are all on the
+            # bind-mounted run directory, and the job file would only mislead a later invocation.
+            subprocess.run(["docker", "rm", "-f", container_name], capture_output=True, text=True)
+            (run_dir / _OPENEMS_JOB_FILE).unlink(missing_ok=True)
+
+    # An ABORTED run (a cancel) exits 2 and deliberately writes NO result.json -- its partial sweep
+    # goes to result.aborted.json instead, so it can be inspected or refitted offline without ever
+    # being cached as if it had converged. See openems_generator_runner.main().
+    aborted_json = run_dir / "result.aborted.json"
+    if exit_code == 2 and aborted_json.exists():
         return {
-            "status": "error", "openems_exit_code": sim_result.returncode,
-            "error": log_text[-2000:], "diagnostics": [],
+            "status": "error", "openems_exit_code": exit_code,
+            "error": (f"openEMS run was cancelled before converging. Its partial, NOT converged "
+                      f"sweep is kept at {aborted_json} and the raw field dumps / probe files are "
+                      f"in {run_dir}; nothing was written to the result cache.\n"
+                      + log_text[-1500:]),
+            "diagnostics": [],
+        }
+    if exit_code is None:
+        return {
+            "status": "error", "openems_exit_code": 1,
+            "error": (f"openEMS run is still going in its own container and was not collected. "
+                      f"Re-run this test to re-attach to it.\n" + log_text[-1500:]),
+            "diagnostics": [],
+        }
+    if exit_code != 0 or not out_json.exists():
+        checkpoint = run_dir / "result.checkpoint.json"
+        extra = (f" A partial Y11 checkpoint survives at {checkpoint}." if checkpoint.exists() else "")
+        return {
+            "status": "error", "openems_exit_code": exit_code,
+            "error": log_text[-2000:] + extra, "diagnostics": [],
         }
     cache_file.write_text(out_json.read_text(encoding="utf-8"), encoding="utf-8")
     data_file.write_text(out_json.read_text(encoding="utf-8"), encoding="utf-8")

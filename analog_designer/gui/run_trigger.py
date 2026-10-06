@@ -35,6 +35,10 @@ class RunTrigger:
         self._process = None
         self._thread = None
         self._container_id = None
+        # Host path of the ABORT file for a detached openEMS run, when one is in flight -- see
+        # analog_designer/sim/run_sim.py's emit_progress_openems_job() for why a FDTD job needs
+        # its own, gentler cancel path than `docker stop`.
+        self._openems_abort_path = None
 
     @property
     def running(self):
@@ -59,7 +63,21 @@ class RunTrigger:
         there) never gets to run managed_container()'s own `finally: docker
         stop` cleanup, unlike a graceful exit. `docker stop` on an id that's
         already gone (job finished naturally right as cancel was clicked)
-        just fails harmlessly -- output is discarded, not checked."""
+        just fails harmlessly -- output is discarded, not checked.
+
+        A detached openEMS run is the one exception, and is handled FIRST: it lives in a container
+        of its own that `docker stop` would kill outright, throwing away however many hours had
+        already converged and losing the port data with them. Dropping an ABORT file in its
+        directory instead makes openEMS stop within seconds and still write out a partial sweep,
+        field dumps and probe files -- that container then exits on its own, and the next run of
+        that test collects it. See run_sim.emit_progress_openems_job()."""
+        if self._openems_abort_path:
+            try:
+                path = Path(self._openems_abort_path)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("cancelled from the GUI\n", encoding="utf-8")
+            except OSError:
+                pass  # best-effort, exactly like the docker stop below
         if self._container_id is not None:
             subprocess.run(["docker", "stop", self._container_id], capture_output=True, text=True)
         if self._process is not None and self._process.poll() is None:
@@ -91,6 +109,11 @@ class RunTrigger:
                 # to `docker stop`, not something a user needs to see.
                 if line.startswith("@PROGRESS CONTAINER "):
                     self._container_id = line[len("@PROGRESS CONTAINER "):]
+                    continue
+                # Same deal for a detached FDTD run: cancel() needs its ABORT path, the user does
+                # not need to see it. An empty path means that job was collected.
+                if line.startswith("@PROGRESS OPENEMSJOB"):
+                    self._openems_abort_path = line[len("@PROGRESS OPENEMSJOB"):].strip() or None
                     continue
                 self._queue.put(line)
             returncode = self._process.wait()
