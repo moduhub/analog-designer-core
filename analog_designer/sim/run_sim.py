@@ -2326,6 +2326,17 @@ def _strip_xyce_print_header(data_file):
     data_file.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
 
 
+def generator_cache_key(geometry):
+    """On-disk identity of ONE generator run's result: a hash of the exact parameter dict the
+    generator produced. Factored out of run_one_openems() so a model-extraction campaign can ask
+    "has this setup already been run?" without reimplementing (and drifting from) the hash."""
+    return hashlib.sha1(json.dumps(geometry, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def generator_cache_dir(block, topology):
+    return workspace.sim_root() / "_generator_cache" / block / topology
+
+
 _OPENEMS_F_MAX_HZ = 20e9
 
 # How often the host checks on a detached FDTD container: new log lines, container state, ETA. A
@@ -2629,8 +2640,8 @@ def run_one_openems(container, test_name, tb_source, conditions, tb_params_base,
     generator = _load_generator_module(block_cfg)
     geometry = generator.geometry_from_params(tb_params_base)
 
-    cache_key = hashlib.sha1(json.dumps(geometry, sort_keys=True).encode()).hexdigest()[:16]
-    cache_dir = workspace.sim_root() / "_generator_cache" / block / topology
+    cache_key = generator_cache_key(geometry)
+    cache_dir = generator_cache_dir(block, topology)
     cache_file = cache_dir / f"{cache_key}.json"
     cache_field_png = cache_dir / f"{cache_key}__field.png"
     data_file = run_dir / f"{test_name}_0.json"
