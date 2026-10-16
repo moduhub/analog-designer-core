@@ -202,7 +202,11 @@ def main():
         if workspace.execution_mode() == "host":
             sys.exit("--run needs docker execution mode: a campaign relies on the detached "
                      "container that only that mode provides.")
-        n_threads = max(1, (os.cpu_count() or 2) - 2)
+        # FDTD is memory-bandwidth bound: on the reference host more than 8 threads gave no speedup
+        # and caused stalls, so the default is 8 (capped at cpu_count - 2), not cpu_count - 2.
+        # Override with ANALOG_DESIGNER_OPENEMS_THREADS.
+        n_threads = int(os.environ.get("ANALOG_DESIGNER_OPENEMS_THREADS")
+                        or min(8, max(1, (os.cpu_count() or 2) - 2)))
         if not _run_missing(status, args.variation, block, topology, block_cfg,
                             args.only, n_threads):
             sys.exit(1)
