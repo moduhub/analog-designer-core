@@ -2378,9 +2378,17 @@ def _openems_launch_detached(container_name, sim_cmd, n_threads):
     needs the container ALIVE and then goes in via `docker exec`. Overriding the entrypoint also
     means no unattended xfce/Xvnc session is started in the first place, so unlike
     managed_container() there is nothing here for _kill_unused_desktop_session() to clean up."""
+    # Anything in this tool's own ANALOG_DESIGNER_* namespace is forwarded, so a per-run knob set in
+    # the launching shell (e.g. a generator's stop criterion) actually reaches the detached container
+    # -- it does not inherit this process's environment the way a `docker exec` into a shared
+    # container would.
+    env_args = ["-e", f"OMP_NUM_THREADS={n_threads}"]
+    for key, value in sorted(os.environ.items()):
+        if key.startswith("ANALOG_DESIGNER_") and key != "ANALOG_DESIGNER_PROGRESS":
+            env_args += ["-e", f"{key}={value}"]
     docker_args = [
         "docker", "run", "-d", "--name", container_name,
-        "-e", f"OMP_NUM_THREADS={n_threads}",
+        *env_args,
         "-v", f"{workspace.PROJECT_ROOT}:{workspace.container_project_root()}",
         "-w", workspace.container_project_root(),
         "--entrypoint", "bash", workspace.container_image(), "-lc", sim_cmd,
@@ -2739,6 +2747,19 @@ def run_one_openems(container, test_name, tb_source, conditions, tb_params_base,
     else:
         container_name = f"ad-openems-{block}-{topology}-{cache_key}"
         exists, running, exit_code = _openems_container_state(container_name)
+        if exists and not running and exit_code != 0 and not any(
+                (run_dir / name).exists() for name in
+                ("result.json", "result.aborted.json", "result.undertime.json")):
+            # Died without producing anything: the host was shut down under it (a Windows update did
+            # exactly this, leaving exit 255), it was OOM-killed, or docker went away. Collecting
+            # such a container only re-reports the failure, so the NEXT invocation would fail too
+            # instead of restarting -- the opposite of what detaching the run is for. Discard it and
+            # fall through to a fresh launch below; openEMS cannot resume, so nothing is carried over.
+            print(f"[openems] container {container_name} died without output (exit {exit_code}) -- "
+                  f"discarding it and starting over")
+            subprocess.run(["docker", "rm", "-f", container_name], capture_output=True, text=True)
+            (run_dir / _OPENEMS_JOB_FILE).unlink(missing_ok=True)
+            exists = running = False
         if exists and running:
             # A previous invocation started this exact geometry and did not live to collect it --
             # a GUI crash, a cancel, a reboot of this process. Hours of FDTD are still running in
