@@ -1095,6 +1095,68 @@ def append_run(variation, test_name, label, conditions, outcome):
     })
 
 
+#: `C {<path>.sym|.sch} ...` component lines in an xschem schematic -- the
+#: path is the first brace-delimited token after the "C".
+_SCH_COMPONENT_REF = re.compile(r"^C \{([^}\s]+\.(?:sym|sch))\}", re.MULTILINE)
+
+
+def _resolve_project_schematic(ref):
+    """Project file a `C {...}` reference points at, or None when it isn't one
+    (PDK/xschem library symbols like sg13g2_pr/rhigh.sym or devices/lab_pin.sym
+    aren't in the project). Accepts project-root-relative paths
+    ("sch/res_wrap/rhigh_s2.sym"), sch/-relative ones ("res_wrap/rhigh_s2.sym")
+    and absolute container paths that contain "/sch/"."""
+    root = workspace.PROJECT_ROOT
+    candidates = [root / ref, root / "sch" / ref]
+    if ref.startswith("/") and "/sch/" in ref:
+        candidates.append(root / "sch" / ref.split("/sch/", 1)[1])
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def schematic_dependency_files(*roots):
+    """Every project schematic/symbol file reachable from the given xschem
+    .sch roots through `C {...}` component references, transitively (root
+    files themselves excluded), sorted by project-relative path so the list
+    is stable. A .sym also pulls in its same-named .sch (the subcircuit
+    body) when one exists, EXCEPT for sch/<block>.sch of a declared block:
+    those are the per-run materialized scratch copies (see
+    materialize_sub_blocks), whose text depends on whichever variation was
+    last run, not on the checked-in design -- hashing them would make
+    results flap stale. Their .sym is still included."""
+    root = workspace.PROJECT_ROOT
+    scratch = {(root / "sch" / f"{block}.sch").resolve() for block in workspace.CONFIG.get("blocks", {})}
+    seen = {Path(r).resolve() for r in roots}
+    found = {}
+    pending = [Path(r) for r in roots]
+    while pending:
+        current = pending.pop()
+        try:
+            text = current.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for ref in _SCH_COMPONENT_REF.findall(text):
+            target = _resolve_project_schematic(ref)
+            if target is None:
+                continue
+            targets = [target]
+            if target.suffix == ".sym":
+                body = target.with_suffix(".sch")
+                if body.is_file():
+                    targets.append(body)
+            for t in targets:
+                resolved = t.resolve()
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+                found[resolved.relative_to(root.resolve()).as_posix()] = resolved
+                if t.suffix == ".sch" and resolved not in scratch:
+                    pending.append(t)
+    return [(rel, path) for rel, path in sorted(found.items()) if path not in scratch]
+
+
 def compute_definition_hash(block_cfg, test_cfg):
     """Hash of everything that defines HOW this test is run and measured --
     independent of which parameter VALUES were simulated (that's the
@@ -1107,6 +1169,15 @@ def compute_definition_hash(block_cfg, test_cfg):
     parts = [json.dumps(test_cfg, sort_keys=True)]
     topology_sch = workspace.PROJECT_ROOT / "sch" / block_cfg["schematic"]
     parts.append(topology_sch.read_text(encoding="utf-8"))
+    # Every project .sch/.sym the topology (and its testbench, below) pulls in
+    # -- wrapper subcircuits, structural sub-blocks, block symbols -- so an
+    # edit there goes stale too. Variation identity (variation_name) is
+    # untouched: it hashes parameters only.
+    dependency_roots = [topology_sch]
+    if "testbench" in test_cfg:
+        dependency_roots.append(workspace.PROJECT_ROOT / test_cfg["testbench"])
+    for rel, path in schematic_dependency_files(*dependency_roots):
+        parts.append(f"{rel}\n{path.read_text(encoding='utf-8')}")
     if "generator" in block_cfg:
         # A "generator"-backed topology's own electrical values come from
         # resolve_generator_params()/openems_generator_runner.py, not from
