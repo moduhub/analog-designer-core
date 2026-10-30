@@ -16,10 +16,21 @@ wrong thing). Keeps the common case (one test, one look at whether the
 layout's parasitics visibly change the curve) cheap; a full-matrix version
 can reuse the same _splice_extracted_subckt() once someone needs it.
 
+Writes its own metrics to sim/<variation>/layout_verify/<test>/
+extracted_result.json (see _write_extracted_result) rather than to
+sim/results.jsonl: these are NOT comparable to a schematic-level result
+row -- typical condition only, no corner/sweep matrix -- and anything
+reading results.jsonl (the Variations table, fom.classify, the release
+page's own spec/Pass columns) would silently start mixing the two if they
+landed in the same log. A separate file per (variation, test) keeps them
+side by side instead, which is exactly how the release page presents them
+(analog_designer.release.export._export_post_layout).
+
 Usage: python -m analog_designer.sim.run_extracted TEST_NAME [VARIATION]
 [--project-root PATH] [--block NAME] [--topology NAME]
 """
 import argparse
+import datetime
 import json
 import re
 import sys
@@ -97,6 +108,63 @@ def _splice_extracted_subckt(netlist_text, block, extracted_text):
     return netlist_text[:dut_match.start()] + extracted_body + netlist_text[dut_match.end():]
 
 
+#: Which parasitics the extracted netlist actually carries, when
+#: layout_verify/extract_result.json doesn't say (every file written before
+#: magic_layout.stage_extract started recording it). Capacitance only:
+#: `extract do resistance`/`ext2spice extresist on` have never been enabled
+#: in that stage -- see its own comment on the Magic segfault that blocks
+#: them -- so no interconnect R is in any extracted netlist to date.
+PARASITICS_UNRECORDED = "capacitance only (no interconnect resistance)"
+
+
+def _write_extracted_result(verify_dir, sim_dir, block, topology, name, test_name, extracted_path, conditions, status, metrics=None, error=None):
+    """extracted_result.json next to this run's own curve PNG(s): what the
+    post-layout run measured, in the same per-metric shape run_sim's own
+    append_results() rows use (name/typical/min/max/unit/...), so a reader
+    can line the two up metric by metric without reformatting either.
+
+    Written for a failed run too (status="error"), on purpose: "the
+    post-layout run of this test failed" is a result a release page or the
+    GUI should be able to state, and the alternative -- no file -- is
+    indistinguishable from "never run" (the same reason
+    analog_designer.release.export's own LVS section prints "not run"
+    rather than omitting itself).
+
+    `parasitics` records WHICH parasitics the netlist this ran against
+    carried, read from magic_layout.stage_extract's own extract_result.json
+    -- a post-layout number means something different with and without
+    interconnect R, and the release page says which one it is rather than
+    letting a reader assume full RC."""
+    extract_result_path = sim_dir / "layout_verify" / "extract_result.json"
+    parasitics = PARASITICS_UNRECORDED
+    if extract_result_path.exists():
+        try:
+            parasitics = json.loads(extract_result_path.read_text(encoding="utf-8")).get("parasitics") or parasitics
+        except (OSError, ValueError):
+            pass
+    payload = {
+        "status": status,
+        "variation": name,
+        "block": block,
+        "topology": topology,
+        "test": test_name,
+        "conditions": conditions,
+        "parasitics": parasitics,
+        # Which netlist produced these numbers, and when it was extracted:
+        # enough for a reader to tell a post-layout result that predates
+        # the layout it is attributed to (the same staleness question the
+        # release page asks of the GDS/raster and the LVS run).
+        "extracted_netlist": extracted_path.name,
+        "extracted_netlist_created": datetime.datetime.fromtimestamp(
+            extracted_path.stat().st_mtime).isoformat(timespec="seconds") if extracted_path.exists() else None,
+        "created": datetime.datetime.now().isoformat(timespec="seconds"),
+        "metrics": metrics or [],
+    }
+    if error:
+        payload["error"] = error
+    (verify_dir / "extracted_result.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
 def run_extracted(block_cfg, params, test_name, variation=None):
     block, topology = workspace.BLOCK, workspace.TOPOLOGY
     test_cfg = workspace.CONFIG["tests"][block][test_name]
@@ -120,6 +188,23 @@ def run_extracted(block_cfg, params, test_name, variation=None):
 
     verify_dir = sim_dir / "layout_verify" / test_name
     verify_dir.mkdir(parents=True, exist_ok=True)
+
+    def _record(status, metrics=None, error=None):
+        """Overwrite this (variation, test)'s own extracted_result.json
+        with what THIS run found -- including a failure. Defined this
+        early on purpose: every failure below (a netlist that won't
+        splice, a netlist/ngspice run that dies, a parser that raises)
+        has to replace a previous run's result rather than leave it
+        standing. Confirmed the hard way on this project's own cmos_vref:
+        a re-extraction whose top-level port list had changed (`vss` ->
+        `vss_uq3`, a real split net in the layout) failed to splice, and
+        with only the parser-level paths recording, the release page went
+        on showing the PREVIOUS run's successful number for a netlist
+        that no longer existed."""
+        _write_extracted_result(
+            verify_dir, sim_dir, block, topology, name, test_name, extracted_path, typical,
+            status, metrics=metrics, error=error,
+        )
 
     tb_source = workspace.PROJECT_ROOT / test_cfg["testbench"]
     tb_text = tb_source.read_text(encoding="utf-8")
@@ -155,12 +240,14 @@ def run_extracted(block_cfg, params, test_name, variation=None):
             verify_dir, container_verify_dir, container_rcfile, ctx,
         )
         if isinstance(netlist_result, dict):
+            _record("error", error=netlist_result.get("error"))
             return netlist_result
         netlist_path = netlist_result
 
         try:
             spliced = _splice_extracted_subckt(netlist_path.read_text(encoding="utf-8"), block, extracted_text)
         except ValueError as exc:
+            _record("error", error=str(exc))
             return {"status": "error", "error": str(exc)}
         netlist_path.write_text(spliced, encoding="utf-8")
         # ngspice reads .spiceinit from its own cwd at startup -- this is
@@ -180,13 +267,17 @@ def run_extracted(block_cfg, params, test_name, variation=None):
             ctx.container, f'cd "{container_verify_dir}" && timeout 290 "{ctx.ngspice}" -b {netlist_path.name}', timeout=300,
         )
         if not data_file.exists():
-            return {"status": "error", "error": (sim_result.stdout + sim_result.stderr)[-2000:]}
+            error = (sim_result.stdout + sim_result.stderr)[-2000:]
+            _record("error", error=error)
+            return {"status": "error", "error": error}
 
     parser_module = load_parser(test_cfg["parser"])
     try:
         raw = parser_module.extract(data_file)
     except Exception as exc:  # noqa: BLE001 -- report, same as run_test()'s own extract() guard
-        return {"status": "error", "error": f"{test_name}: extract() failed on the extracted-netlist run: {exc}"}
+        error = f"{test_name}: extract() failed on the extracted-netlist run: {exc}"
+        _record("error", error=error)
+        return {"status": "error", "error": error}
 
     runs = [{"conditions": typical, **raw}]
     plot_base = verify_dir / f"{test_name}_extracted"
@@ -195,7 +286,10 @@ def run_extracted(block_cfg, params, test_name, variation=None):
     try:
         outcome = parser_module.evaluate(runs, test_cfg["outputs"], typical, plot_base=plot_base)
     except Exception as exc:  # noqa: BLE001 -- report, same as run_test()'s own evaluate() guard
-        return {"status": "error", "error": f"{test_name}: evaluate() failed on the extracted-netlist run: {exc}"}
+        error = f"{test_name}: evaluate() failed on the extracted-netlist run: {exc}"
+        _record("error", error=error)
+        return {"status": "error", "error": error}
+    _record("success", metrics=outcome)
     return {"status": "success", "variation": name, "test": test_name, "result": outcome, "plot": str(plot_base) + ".png"}
 
 
