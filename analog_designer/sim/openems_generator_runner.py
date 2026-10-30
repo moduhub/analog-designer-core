@@ -46,6 +46,7 @@ Usage:
 import argparse
 import importlib.util
 import json
+import math
 import os
 import sys
 import threading
@@ -63,6 +64,49 @@ ABORT_FILENAME = "ABORT"
 # kill -- docker kill, an OOM, a host reboot, none of which give openEMS a chance to see ABORT --
 # can cost: at most this much progress, never the whole run.
 CHECKPOINT_INTERVAL_S = int(os.environ.get("ANALOG_DESIGNER_OPENEMS_CHECKPOINT_S", "600"))
+
+# Shortest run, as a multiple of the excitation pulse's own length, whose port DFT is worth
+# believing. openEMS integrates the port probes over the run's whole length, so a run that stops
+# soon after the excitation has a badly truncated transform -- and it fails QUIETLY: the sweep comes
+# out smooth and plausible, just wrong.
+#
+# Measured on this project's own runs, all at the same excitation length (2.865e-10s):
+#   N=3 W=5um  d220, stopped at -60dB: 4.56 excitations -> Ldiff 7.80nH, SRF 8.39GHz   (sound)
+#   N=4 W=5um  d250, stopped at -60dB: 6.87 excitations -> Ldiff 13.09nH, SRF 5.34GHz  (sound)
+#   N=3 W=15um d350, stopped at -40dB: 1.44 excitations -> Ldiff 0.32nH, no SRF        (nonsense:
+#       25x too little inductance, a fifth of the DC resistance the winding's own geometry forces,
+#       and Im(Z) saturating instead of rising with frequency)
+#
+# The energy criterion alone does not bound this, which is the trap: it is a RELATIVE measure, so
+# the same -40dB lands at 2.84 excitations on one coil and 1.44 on another. A low-resistance
+# winding reaches any given energy sooner in units of its own ringing. 4.0 sits below both sound
+# runs and well above the failure.
+MIN_RUN_EXCITATIONS = float(os.environ.get("ANALOG_DESIGNER_OPENEMS_MIN_EXCITATIONS", "4.0"))
+
+
+def excitation_length_s(f_max_hz):
+    """Length of openEMS's Gaussian excitation, in seconds, for SetGaussExcite(f_max/2, f_max/2) --
+    which is what every generator in this project uses. Verified against three real run logs, all of
+    which print exactly this value for f_max=20GHz (2.86479e-10s)."""
+    return 9.0 / (math.pi * (f_max_hz / 2.0))
+
+
+def port_run_length_s(sim_path):
+    """How much simulated time the port probes actually cover: the last timestamp they recorded.
+    Read from the probe files rather than from the engine, so it reflects what the DFT really saw."""
+    last = 0.0
+    for name in os.listdir(sim_path):
+        if not name.startswith("port_"):
+            continue
+        with open(os.path.join(sim_path, name), encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if line.startswith("%") or not line.strip():
+                    continue
+                try:
+                    last = max(last, float(line.split()[0]))
+                except (ValueError, IndexError):
+                    continue
+    return last
 
 
 def _load_generator(path):
@@ -390,6 +434,18 @@ def run_and_extract(generator, geometry, stack, sim_path, f_max_hz, n_freq=201, 
     # original small/validated geometry show the identical pattern).
     result = y11_result(port, sim_path, freqs)
     result["aborted"] = aborted
+
+    # See MIN_RUN_EXCITATIONS: a run that stopped too soon after its own excitation produces a
+    # smooth, plausible and wrong sweep, so measure what the probes actually cover and let main()
+    # refuse it rather than caching it.
+    excitation_s = excitation_length_s(f_max_hz)
+    covered_s = port_run_length_s(sim_path)
+    result["excitations"] = (covered_s / excitation_s) if excitation_s > 0 else None
+    result["run_length_s"] = covered_s
+    if result["excitations"] is not None:
+        print(f"run covered {covered_s:.4g}s = {result['excitations']:.2f} x the excitation "
+              f"({excitation_s:.4g}s); minimum for a trustworthy DFT is "
+              f"{MIN_RUN_EXCITATIONS:.2f}", flush=True)
     return result
 
 
@@ -580,6 +636,22 @@ def main():
             except Exception as exc:  # noqa: BLE001 -- see comment above
                 print(f"ParaView export failed for {label} (non-fatal, Y11 result unaffected): {exc}")
 
+    excitations = result.get("excitations")
+    if excitations is not None and excitations < MIN_RUN_EXCITATIONS and not result.get("aborted"):
+        # Converged on energy, but over too short a window for the port DFT to mean anything. NOT
+        # cached, for the same reason an aborted run is not: run_one_openems copies --cache-out
+        # straight into the generator cache, where this would be served forever as a measurement.
+        short_path = os.path.splitext(args.cache_out)[0] + ".undertime.json"
+        write_json_atomic(short_path, cache_doc_from_result(
+            geometry, result, undertime=True, converged=False,
+            excitations=excitations, end_criteria=getattr(generator, "END_CRITERIA", None)))
+        print(f"REJECTED: the run covered only {excitations:.2f} excitation lengths, below the "
+              f"{MIN_RUN_EXCITATIONS:.2f} needed for the port DFT to be trustworthy. The sweep is "
+              f"saved at {short_path} for inspection and was NOT cached as a result.")
+        print(f"The stop criterion is energy-relative, so it does not bound run LENGTH -- lower "
+              f"END_CRITERIA (e.g. 1e-6) for this structure and run it again.")
+        return 3
+
     if result.get("aborted"):
         # A cancelled run. The sweep is real but under-converged, so it must NOT land in --cache-out:
         # run_one_openems() copies that file straight into sim/_generator_cache/, where it would be
@@ -589,12 +661,17 @@ def main():
         # <out>_sim) is already on disk and is deliberately left there.
         partial_path = os.path.splitext(args.cache_out)[0] + ".aborted.json"
         write_json_atomic(partial_path, cache_doc_from_result(
-            geometry, result, aborted=True, converged=False))
+            geometry, result, aborted=True, converged=False,
+            end_criteria=getattr(generator, "END_CRITERIA", None)))
         print(f"Run was ABORTED -- partial Y11(f) saved to {partial_path} (NOT cached as a result)")
         print(f"SRF/peak-Q above are from that partial sweep and are not converged values.")
         return 2
 
-    write_json_atomic(args.cache_out, cache_doc_from_result(geometry, result))
+    # The stop criterion is NOT part of the geometry, so it does not reach the cache KEY -- two runs
+    # of the same setup stopped at different energies would otherwise be indistinguishable on disk.
+    # Recorded in the document instead, so anything combining several runs can see what it is mixing.
+    write_json_atomic(args.cache_out, cache_doc_from_result(
+        geometry, result, end_criteria=getattr(generator, "END_CRITERIA", None)))
     print(f"Y11(f) cache JSON written to {args.cache_out}")
 
     fitted = generator.fit_electrical_params(geometry, stack, em_result=result)

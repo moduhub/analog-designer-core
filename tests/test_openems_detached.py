@@ -158,3 +158,48 @@ class WriteVtrTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RunLengthGuardTests(unittest.TestCase):
+    """The guard that would have caught the 5h42m run whose sweep was smooth, plausible and wrong.
+
+    openEMS integrates the port probes over the run's whole length, so a run that stops soon after
+    its excitation has a badly truncated DFT. The energy criterion does not bound this: it is
+    relative, so the same -40dB landed at 2.84 excitation lengths on one coil and 1.44 on another.
+    """
+
+    def test_excitation_length_matches_real_logs(self):
+        # Three real runs at f_max=20GHz all printed "Excitation signal length is: ... (2.86479e-10s)".
+        from analog_designer.sim.openems_generator_runner import excitation_length_s
+        self.assertAlmostEqual(excitation_length_s(20e9), 2.86479e-10, delta=1e-15)
+
+    def test_port_run_length_reads_the_last_timestamp(self):
+        from analog_designer.sim.openems_generator_runner import port_run_length_s
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "port_ut_1").write_text(
+                "% header line\n0 1.0\n1e-10 2.0\n4.125e-10 3.0\n", encoding="utf-8")
+            Path(tmp, "port_it_1").write_text(
+                "% header\n0 1.0\n4.0e-10 2.0\n", encoding="utf-8")
+            Path(tmp, "et").write_text("ignored\n", encoding="utf-8")
+            self.assertAlmostEqual(port_run_length_s(tmp), 4.125e-10, delta=1e-16)
+
+    def test_a_malformed_line_does_not_abort_the_read(self):
+        from analog_designer.sim.openems_generator_runner import port_run_length_s
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "port_ut_1").write_text(
+                "% h\n0 1.0\nnot-a-number x\n2e-10 3.0\n", encoding="utf-8")
+            self.assertAlmostEqual(port_run_length_s(tmp), 2e-10, delta=1e-16)
+
+    def test_the_threshold_separates_the_real_runs(self):
+        from analog_designer.sim.openems_generator_runner import (
+            MIN_RUN_EXCITATIONS, excitation_length_s)
+        excitation = excitation_length_s(20e9)
+        # Measured port coverage of this project's own three completed runs.
+        sound = {"N=3 W=5 d220": 1.306e-09, "N=4 W=5 d250": 1.969e-09}
+        broken = {"N=3 W=15 d350": 4.125e-10}
+        for name, covered in sound.items():
+            self.assertGreaterEqual(covered / excitation, MIN_RUN_EXCITATIONS,
+                                    f"{name} produced a sound model and must not be rejected")
+        for name, covered in broken.items():
+            self.assertLess(covered / excitation, MIN_RUN_EXCITATIONS,
+                            f"{name} produced nonsense and must be rejected")

@@ -2788,6 +2788,19 @@ def run_one_openems(container, test_name, tb_source, conditions, tb_params_base,
                       + log_text[-1500:]),
             "diagnostics": [],
         }
+    # Exit 3: the run converged on energy but over too short a window for its own port DFT to be
+    # meaningful (see openems_generator_runner.MIN_RUN_EXCITATIONS). Like an abort, it writes its
+    # sweep beside the cache path instead of into it, so a wrong-but-plausible result can never be
+    # served as a measurement.
+    undertime_json = run_dir / "result.undertime.json"
+    if exit_code == 3 and undertime_json.exists():
+        return {
+            "status": "error", "openems_exit_code": exit_code,
+            "error": (f"openEMS run was too short for its own DFT -- the sweep it produced is smooth "
+                      f"and plausible but wrong. Kept at {undertime_json} for inspection; nothing "
+                      f"was cached.\n" + log_text[-1500:]),
+            "diagnostics": [],
+        }
     if exit_code is None:
         return {
             "status": "error", "openems_exit_code": 1,
