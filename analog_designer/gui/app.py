@@ -62,11 +62,17 @@ sim/results.jsonl while a background job is appending to them.
 
 Release exports the selected variation as its block's presentable snapshot
 for an outside evaluator -- materialized schematic under
-release/xschem/sch/, a results writeup under release/doc/<block>/README.md
-(see analog_designer.release.export.export_release) -- same synchronous,
+release/xschem/sch/, the drawn layout's GDS + a raster of it, the LVS report
+plus a re-runnable run_lvs.sh under release/lvs/<block>/, and a results
+writeup under release/doc/<block>/README.md tying them together (see
+analog_designer.release.export.export_release) -- same synchronous,
 trigger.running-gated shape as Trim, not routed through RunTrigger either,
 though it does briefly open its own docker container (unlike Trim) to render
-a schematic PNG for that writeup.
+a schematic PNG for that writeup. The layout/LVS half is copied as pro's
+Layout tab last left it on disk (nothing here runs Magic/netgen), so the
+dialog below reports both statuses back -- "not drawn yet", "not run" or
+"(stale)" is exactly what a designer needs to see about the pick they just
+released.
 """
 import sys
 import time
@@ -805,8 +811,9 @@ class App(ttk.Frame):
 
     def _export_release(self):
         """Exports the selected variation as its block's release pick --
-        materialized schematic under release/xschem/sch/, results writeup
-        under release/doc/<block>/README.md (see analog_designer.release.export).
+        materialized schematic under release/xschem/sch/, the drawn layout
+        and its LVS evidence under release/layout/ and release/lvs/, results
+        writeup under release/doc/<block>/README.md (see analog_designer.release.export).
         Synchronous, gate only on trigger.running (same pattern as
         _trim_selected above, not routed through RunTrigger) -- but unlike
         _trim_selected's pure local file I/O, export_release() does open one
@@ -823,10 +830,13 @@ class App(ttk.Frame):
         name = self.selected_variation
         if not messagebox.askyesno(
             "Release",
-            f"Export {name!r} as its block's release pick (release/xschem/sch/ + release/doc/)? "
-            "This overwrites that block's existing release files -- and, for a hierarchical "
-            "block, its sub-block dependencies' release schematics too. Renders a schematic "
-            "PNG via a temporary docker container, so this will take a few seconds.",
+            f"Export {name!r} as its block's release pick (release/xschem/sch/ + release/layout/ "
+            "+ release/lvs/ + release/doc/)? This overwrites that block's existing release files "
+            "-- and, for a hierarchical block, its sub-block dependencies' release schematics too. "
+            "The layout GDS/raster and the LVS report are published as the Layout tab last left "
+            "them on disk (nothing is re-run here), and the result below says so if either is "
+            "missing or older than the layout itself. Renders a schematic PNG via a temporary "
+            "docker container, so this will take a few seconds.",
         ):
             return
         try:
@@ -834,11 +844,15 @@ class App(ttk.Frame):
         except SystemExit as exc:
             messagebox.showerror("Release", str(exc))
             return
-        self.status_var.set(f"exported {result['block']} release: {name}")
+        self.status_var.set(
+            f"exported {result['block']} release: {name} (layout: {result['layout']}, LVS: {result['lvs']})"
+        )
         messagebox.showinfo(
             "Release",
             f"Exported {result['block']}/{result['topology']} variation {name} to "
-            f"release/xschem/sch/ and release/doc/{result['block']}/.",
+            f"release/xschem/sch/ and release/doc/{result['block']}/.\n\n"
+            f"Layout: {result['layout']}\n"
+            f"LVS: {result['lvs']}",
         )
 
     def _run_option_kwargs(self):
